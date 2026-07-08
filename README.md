@@ -52,6 +52,9 @@ Per-camera, under that device's own settings:
   detection (e.g. via Scrypted's Video Analysis / OpenCV plugin) and HomeKit Secure Video. Only
   the small control channel touches Nanit's cloud continuously either way - the video stays local
   whenever a local stream is active, regardless of this setting.
+- **Report Temperature/Humidity** - off by default, independent of the setting above. Exposes the
+  camera's temperature/humidity readings to HomeKit. Requires the camera to be seated in a stand
+  with a working sensor.
 
 With "Keep Local Stream Connected" **off**, the device is still declared as a Battery camera in
 Scrypted, for the same reason as before: so Scrypted doesn't pre-buffer / stay connected 24/7.

@@ -1,4 +1,4 @@
-import { Battery, BinarySensor, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
+import { Battery, BinarySensor, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, HumiditySensor, Intercom, MediaObject, MediaStreamOptions, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, TemperatureUnit, Thermometer, VideoCamera } from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
 import { StorageSettings } from "@scrypted/sdk/storage-settings"
 import axios, { AxiosRequestConfig } from 'axios'
@@ -21,11 +21,18 @@ interface NanitBaby {
     camera_uid: string;
 }
 
-class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, BinarySensor, Battery, Settings {
+class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, BinarySensor, Battery, Thermometer, HumiditySensor, Settings {
     settingsStorage = new StorageSettings(this, {
         persistentLocalStream: {
             title: 'Keep Local Stream Connected',
             description: 'Off (default): the local stream and its cloud control/signaling connection are only requested while something is actively viewing (matches this plugin\'s original Battery-camera behavior - lower footprint, no background motion/sound detection). On: the control connection stays open continuously so the local stream loads near-instantly and motion/sound detection work in the background. Only the lightweight control channel touches Nanit\'s cloud continuously either way - video itself stays on the LAN whenever a local stream is active.',
+            type: 'boolean',
+            defaultValue: false,
+            onPut: async () => this.plugin.applyDeviceMode(this.nativeId!),
+        },
+        reportClimateSensors: {
+            title: 'Report Temperature/Humidity',
+            description: 'Off (default): temperature/humidity are not exposed and no connection is opened just for them. On: exposes this camera\'s temperature and humidity readings to HomeKit. Independent of "Keep Local Stream Connected" - if that\'s off, this keeps just the lightweight cloud control/signaling connection open on its own (no local video streaming triggered by this alone) so sensor readings keep updating in the background. Note: Nanit\'s temperature/humidity sensor lives in the camera stand, not the camera body - this has no effect if the camera isn\'t seated in a stand with a working sensor.',
             type: 'boolean',
             defaultValue: false,
             onPut: async () => this.plugin.applyDeviceMode(this.nativeId!),
@@ -45,6 +52,10 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
 
     get persistentLocalStream(): boolean {
         return !!this.settingsStorage.values.persistentLocalStream;
+    }
+
+    get reportClimateSensors(): boolean {
+        return !!this.settingsStorage.values.reportClimateSensors;
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -152,9 +163,10 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
     }
 
     // Fed by the camera's control-channel PUT_SENSOR_DATA pushes (only received while a control
-    // connection is open - i.e. reliably in "Keep Local Stream Connected" mode). isAlert as the
-    // trigger condition is inferred from the field name in Nanit's protocol, not yet confirmed
-    // against real hardware.
+    // connection is open - i.e. reliably in "Keep Local Stream Connected" mode). The MOTION/SOUND
+    // branches are kept for protocol completeness but haven't been observed firing in practice -
+    // motion/sound notifications appear to be delivered through a separate push-notification
+    // channel instead, not this control connection. TEMPERATURE/HUMIDITY are confirmed working.
     handleSensorData(sensor: DecodedSensorData) {
         this.console.log(`[${this.nativeId}] sensor data: ${JSON.stringify(sensor)}`);
         if (sensor.sensorType === 'MOTION' && sensor.isAlert) {
@@ -165,6 +177,26 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
             this.console.log(`[${this.nativeId}] triggering sound/binary state from sensor data`);
             this.triggerBinaryState();
         }
+        else if (sensor.sensorType === 'TEMPERATURE' && sensor.valueMilli !== undefined) {
+            // valueMilli is a milli-units reading (i.e. divide by 1000 for the actual value).
+            // Confirmed against real hardware readings; the range check below just guards against
+            // the -1000/-1000000 "no data" sentinel this field can also carry, so HomeKit doesn't
+            // show a nonsensical -1000C reading.
+            const celsius = sensor.valueMilli / 1000;
+            if (celsius > -50 && celsius < 80)
+                this.temperature = celsius;
+        }
+        else if (sensor.sensorType === 'HUMIDITY' && sensor.valueMilli !== undefined) {
+            const percent = sensor.valueMilli / 1000;
+            if (percent >= 0 && percent <= 100)
+                this.humidity = percent;
+        }
+    }
+
+    async setTemperatureUnit(temperatureUnit: TemperatureUnit): Promise<void> {
+        // Display preference only - Thermometer.temperature is always reported in Celsius
+        // regardless of this setting.
+        this.temperatureUnit = temperatureUnit;
     }
 }
 
@@ -512,28 +544,52 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
         if (!device)
             return;
 
-        // Battery is declared only in on-demand mode, and dropped entirely in persistent mode -
-        // matches the original plugin's convention (Battery = on-demand/low-footprint) and is
-        // also what Rebroadcast's prebuffer-mixin (plugins/prebuffer-mixin/src/main.ts,
-        // shouldDisableBatteryPrebuffer()) keys off of first: it returns null (falsy - prebuffer
-        // not disabled) the moment Battery isn't in the interfaces list at all, without even
-        // looking at Charger/chargeState/batteryLevel. So no Charger interface is needed here -
-        // it only matters for "Battery present but still want continuous prebuffer", which isn't
-        // our case. batteryLevel is set unconditionally since HomeKit's battery.ts only checks
-        // for the Battery interface's presence, not the level, to decide whether to show it.
+        // Battery is declared unless we're both in persistent mode AND local video is *currently*
+        // confirmed alive - matches the original plugin's convention (Battery = on-demand/low-
+        // footprint) and is also what Rebroadcast's prebuffer-mixin
+        // (plugins/prebuffer-mixin/src/main.ts, shouldDisableBatteryPrebuffer()) keys off of
+        // first: it returns null (falsy - prebuffer not disabled) the moment Battery isn't in the
+        // interfaces list at all, without even looking at Charger/chargeState/batteryLevel. So no
+        // Charger interface is needed here - it only matters for "Battery present but still want
+        // continuous prebuffer", which isn't our case. batteryLevel is set unconditionally since
+        // HomeKit's battery.ts only checks for the Battery interface's presence, not the level.
+        //
+        // Deliberately checking live RTMP health here, not just the persistentLocalStream setting:
+        // if local streaming is down for an extended stretch (camera unreachable, firewall rule
+        // dropped, etc) while persistent mode is on, telling Rebroadcast "no Battery, prebuffer me
+        // continuously" would make it keep a prebuffer session alive by repeatedly calling our
+        // getVideoStream() - each of which would silently fall back to the cloud URL, and
+        // Rebroadcast would hold *that* ffmpeg process open continuously. That's exactly the
+        // persistent-cloud-connection behavior this plugin exists to avoid, just reintroduced
+        // through prebuffering instead of our own code. This is recomputed reactively whenever
+        // local health changes (see the LocalRtmpServer 'alive'/'unhealthy' listeners below), not
+        // just when the setting itself is toggled.
+        const localHealthy = this.rtmpServer?.isAlive(nativeId) ?? false;
+        const allowContinuousPrebuffer = device.persistentLocalStream && localHealthy;
+
         const interfaces = [
             ScryptedInterface.Camera,
             ScryptedInterface.VideoCamera,
             ScryptedInterface.Settings,
         ];
         if (device.persistentLocalStream)
+            // MotionSensor/BinarySensor are only ever fed by the control channel's sensor-data
+            // pushes while a control connection is kept open continuously - that's independent of
+            // whether local *video* happens to be healthy right now, so this stays tied to the
+            // setting alone, unlike the Battery decision above.
             interfaces.push(ScryptedInterface.MotionSensor, ScryptedInterface.BinarySensor);
-        else
+        if (!allowContinuousPrebuffer)
             interfaces.push(ScryptedInterface.Battery);
+
+        // Independent of persistentLocalStream by design - "Report Temperature/Humidity" can keep
+        // the control channel open purely for sensor telemetry even when local video streaming is
+        // only requested on demand. See ensureSensorConnection().
+        if (device.reportClimateSensors)
+            interfaces.push(ScryptedInterface.Thermometer, ScryptedInterface.HumiditySensor);
 
         device.batteryLevel = 100;
 
-        this.console.log(`[${nativeId}] applying device mode: persistentLocalStream=${device.persistentLocalStream}, interfaces=[${interfaces.join(', ')}]`);
+        this.console.log(`[${nativeId}] applying device mode: persistentLocalStream=${device.persistentLocalStream}, reportClimateSensors=${device.reportClimateSensors}, interfaces=[${interfaces.join(', ')}]`);
         await deviceManager.onDeviceDiscovered({
             nativeId,
             type: ScryptedDeviceType.Camera,
@@ -548,10 +604,15 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             this.ensureLocalStream(nativeId).catch(err =>
                 this.console.warn(`failed to start persistent local stream for ${nativeId}: ${err.message}`));
         }
+        else if (device.reportClimateSensors) {
+            this.cancelScheduledTeardown(nativeId);
+            this.ensureSensorConnection(nativeId).catch(err =>
+                this.console.warn(`[${nativeId}] failed to start sensor-only control connection: ${err.message}`));
+        }
         else if (!this.rtmpServer?.subscriberCount(nativeId)) {
-            // Switching out of persistent mode with nobody currently watching - nothing will
-            // otherwise trigger the on-demand teardown (that normally fires off a donePlay event),
-            // so schedule it directly.
+            // Neither mode wants the connection kept alive, and nobody's currently watching -
+            // nothing will otherwise trigger the on-demand teardown (that normally fires off a
+            // donePlay event), so schedule it directly.
             this.scheduleTeardown(nativeId);
         }
     }
@@ -591,18 +652,32 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             const port = Number(this.settingsStorage.values.localStreamPort) || 1935;
             const server = new LocalRtmpServer(port, this.console);
 
+            server.on('alive', (streamKey: string) => {
+                // Local video just started (or resumed) publishing - re-evaluate whether it's now
+                // safe to tell Rebroadcast's prebuffer-mixin it can prebuffer this camera
+                // continuously (see the comment on the Battery decision in applyDeviceMode()).
+                this.applyDeviceMode(streamKey).catch(err =>
+                    this.console.warn(`[${streamKey}] failed to update device mode after becoming alive: ${err.message}`));
+            });
+
             server.on('unhealthy', (streamKey: string) => {
                 const device = this.devices.get(streamKey);
                 if (!device)
                     return;
-                // Camera's publish connection dropped. Re-request the redirect if we still care
-                // about this stream (persistent mode, or a viewer is still attached).
-                if (device.persistentLocalStream || server.subscriberCount(streamKey) > 0) {
-                    this.console.log(`[${streamKey}] local stream: publisher dropped, re-requesting (persistent=${device.persistentLocalStream}, subscribers=${server.subscriberCount(streamKey)})`);
+                // Camera's publish connection dropped. Recompute interfaces immediately so Battery
+                // comes back the moment local health changes, not just when the "Keep Local Stream
+                // Connected" setting itself is toggled - for persistent mode this also re-requests
+                // the redirect as a side effect (see applyDeviceMode()), so only the on-demand
+                // case with an active viewer needs its own explicit retry here.
+                this.applyDeviceMode(streamKey).catch(err =>
+                    this.console.warn(`[${streamKey}] failed to update device mode after publisher drop: ${err.message}`));
+
+                if (!device.persistentLocalStream && server.subscriberCount(streamKey) > 0) {
+                    this.console.log(`[${streamKey}] local stream: publisher dropped, re-requesting for active viewer`);
                     this.ensureLocalStream(streamKey).catch(err =>
                         this.console.warn(`[${streamKey}] local stream: failed to re-establish after drop: ${err.message}`));
                 }
-                else {
+                else if (!device.persistentLocalStream) {
                     this.console.log(`[${streamKey}] local stream: publisher dropped, no active viewers - not re-requesting`);
                 }
             });
@@ -659,6 +734,13 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             stop
                 .catch(err => this.console.warn(`failed to send STOPPED for ${nativeId}: ${err.message}`))
                 .finally(() => {
+                    // "Report Temperature/Humidity" independently needs this same connection kept
+                    // alive even with no video viewers - only stop the local video publish above,
+                    // leave the control channel itself open in that case.
+                    if (this.devices.get(nativeId)?.reportClimateSensors) {
+                        this.console.log(`[${nativeId}] local stream: keeping control connection open for climate sensor reporting`);
+                        return;
+                    }
                     connection.dispose();
                     this.controlConnections.delete(nativeId);
                 });
@@ -683,6 +765,39 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             return configured;
         const addresses = await sdk.endpointManager.getLocalAddresses();
         return addresses?.[0];
+    }
+
+    private async getCameraUid(nativeId: string): Promise<string | undefined> {
+        let cameraUid = this.cameraUidByNativeId.get(nativeId);
+        if (!cameraUid) {
+            this.console.log(`[${nativeId}] camera_uid not cached yet, fetching /babies`);
+            await this.fetchBabies();
+            cameraUid = this.cameraUidByNativeId.get(nativeId);
+        }
+        return cameraUid;
+    }
+
+    /**
+     * Ensures the control channel is connected purely for sensor telemetry (motion/temperature/
+     * humidity), independent of local video streaming - "Report Temperature/Humidity" can be on
+     * while "Keep Local Stream Connected" is off, in which case this is the only thing keeping
+     * the control WebSocket open. Never touches the local RTMP server or sends PUT_STREAMING;
+     * the camera starts pushing sensor data on its own once GET_SENSOR_DATA has been sent, which
+     * NanitControlConnection already does automatically as soon as it connects.
+     */
+    private async ensureSensorConnection(nativeId: string): Promise<void> {
+        const cameraUid = await this.getCameraUid(nativeId);
+        if (!cameraUid) {
+            this.console.warn(`[${nativeId}] climate sensors: no camera_uid known, cannot connect`);
+            return;
+        }
+        const connection = this.getControlConnection(nativeId, cameraUid);
+        try {
+            await connection.ensureConnected();
+        }
+        catch (err) {
+            this.console.warn(`[${nativeId}] climate sensors: failed to connect: ${(err as Error).message}`);
+        }
     }
 
     /**
@@ -723,12 +838,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             return undefined;
         }
 
-        let cameraUid = this.cameraUidByNativeId.get(nativeId);
-        if (!cameraUid) {
-            this.console.log(`${prefix} camera_uid not cached yet, fetching /babies`);
-            await this.fetchBabies();
-            cameraUid = this.cameraUidByNativeId.get(nativeId);
-        }
+        const cameraUid = await this.getCameraUid(nativeId);
         if (!cameraUid) {
             this.console.warn(`${prefix} no camera_uid known for this device - falling back to cloud`);
             return undefined;
