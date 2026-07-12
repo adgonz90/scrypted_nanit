@@ -184,9 +184,11 @@ export class NanitControlConnection {
             }
         }
 
-        // Diagnostic-only for now - just observing when/how often this shows up before deciding
-        // whether it's a reliable enough signal to act on. Not gated by verbose logging: it's rare
-        // and we specifically want it visible in normal captures while we're still characterizing it.
+        // Logged only, not acted on: in practice this notice consistently arrives several seconds
+        // after LocalRtmpServer's own packet-freshness watchdog has already detected and recovered
+        // from a stalled publish, and it can also fire with no corresponding publish interruption at
+        // all - so it isn't a reliable enough signal to drive reconnect logic on its own. Not gated
+        // by verbose logging since it's rare and worth keeping visible.
         if (message.type === 'REQUEST' && message.request?.type === 'STREAM_STATUS_NOTICE') {
             const detail = message.request.streamStatusNotice?.detail;
             this.logger.log(`${this.logPrefix} received stream status notice: code=${detail?.code}, reason=${detail?.reason}`);

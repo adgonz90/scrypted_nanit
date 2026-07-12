@@ -71,6 +71,10 @@ Snapshots derive from whichever stream (local or cloud) is actually in use, the 
 `takePicture()` always has - they were unreliable before mainly because they depended on a fresh
 ~10s cloud RTMPS handshake per request; a local, low-latency source removes that bottleneck.
 
+If the camera's local publish connection goes stale (stays connected but stops sending data - can
+happen after a network hiccup or power interruption), the plugin detects it, recovers the
+connection, and reconnects automatically. No manual restart should be needed.
+
 
 ## Importing into Home Assistant
 ### Method 1
