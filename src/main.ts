@@ -168,7 +168,8 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
     // motion/sound notifications appear to be delivered through a separate push-notification
     // channel instead, not this control connection. TEMPERATURE/HUMIDITY are confirmed working.
     handleSensorData(sensor: DecodedSensorData) {
-        this.console.log(`[${this.nativeId}] sensor data: ${JSON.stringify(sensor)}`);
+        if (this.plugin.verboseLogging)
+            this.console.log(`[${this.nativeId}] sensor data: ${JSON.stringify(sensor)}`);
         if (sensor.sensorType === 'MOTION' && sensor.isAlert) {
             this.console.log(`[${this.nativeId}] triggering motion from sensor data`);
             this.triggerMotion();
@@ -282,7 +283,17 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             type: 'number',
             defaultValue: 8000,
         },
+        verboseLogging: {
+            title: 'Verbose Logging',
+            description: 'Off (default): only state-transition/meaningful events are logged (login, LOCAL vs CLOUD stream decisions, publisher connect/disconnect, device mode changes, warnings). On: also logs high-frequency framework-level scaffolding (every getDevice() call, every device event, every device sync) - noisy, only useful when actively debugging.',
+            type: 'boolean',
+            defaultValue: false,
+        },
     });
+
+    get verboseLogging(): boolean {
+        return !!this.settingsStorage.values.verboseLogging;
+    }
 
     constructor() {
         super();
@@ -321,7 +332,8 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     }
 
     onDeviceEvent(eventInterface: string, eventData: any): Promise<void> {
-        this.console.log("Device Event occured " + eventInterface)
+        if (this.verboseLogging)
+            this.console.log("Device Event occured " + eventInterface)
         return Promise.resolve();
     }
 
@@ -503,7 +515,8 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     }
 
     async syncDevices(duration: number) {
-        this.console.log("Sync Devices")
+        if (this.verboseLogging)
+            this.console.log("Sync Devices")
         const babies = await this.fetchBabies();
         const devices: Device[] = [];
         for (const camera of babies) {
@@ -532,7 +545,8 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
         await deviceManager.onDevicesChanged({
             devices,
         });
-        this.console.log('discovered devices');
+        if (this.verboseLogging)
+            this.console.log('discovered devices');
     }
 
     // Recomputes and re-publishes a single device's declared interfaces after its
@@ -618,7 +632,8 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     }
 
     async getDevice(nativeId: string) {
-        this.console.log("get device with id " + nativeId)
+        if (this.verboseLogging)
+            this.console.log("get device with id " + nativeId)
         if (!this.devices.has(nativeId)) {
             const camera = new NanitCameraDevice(this, nativeId);
 
@@ -708,7 +723,12 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             connection = new NanitControlConnection(cameraUid, async () => {
                 await this.tryLogin();
                 return this.access_token;
-            }, this.console);
+            }, {
+                log: message => this.console.log(message),
+                warn: message => this.console.warn(message),
+                error: message => this.console.error(message),
+                verbose: message => { if (this.verboseLogging) this.console.log(message); },
+            });
             connection.onSensorData = sensor => this.devices.get(nativeId)?.handleSensorData(sensor);
             this.controlConnections.set(nativeId, connection);
         }

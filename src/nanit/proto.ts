@@ -58,6 +58,14 @@ enum RequestType {
   PUT_TCP_REQUEST = 45;
   GET_STING_START = 46;
   GET_LOGS_URI = 47;
+
+  // Not documented in any publicly known schema for this protocol (the highest known value is 47) -
+  // reverse-engineered from 4 samples of otherwise-"malformed" messages this camera actually sent.
+  // Name/meaning is our own inference, not confirmed: every sample carried a nested string field
+  // reading "disconnected" (see StreamStatusNotice below) and arrived on the control channel a few
+  // seconds before our RTMP server's own TCP-level disconnect was observed. Kept distinct from a
+  // firm name like PUT_STREAM_DISCONNECTED until more samples confirm it's always disconnect-related.
+  STREAM_STATUS_NOTICE = 50;
 }
 
 enum SensorType {
@@ -105,6 +113,17 @@ message Streaming {
   optional int32 attempts = 4;
 }
 
+// Reverse-engineered structure backing STREAM_STATUS_NOTICE above - field numbers and nesting
+// confirmed byte-for-byte against real wire captures, but names/semantics are our own guess.
+message StreamStatusDetail {
+  optional int64 code = 1;
+  optional string reason = 3;
+}
+
+message StreamStatusNotice {
+  optional StreamStatusDetail detail = 3;
+}
+
 message Request {
   required int32 id = 1;
   required RequestType type = 2;
@@ -113,6 +132,7 @@ message Request {
   repeated SensorData sensorData = 13;
 
   optional Streaming streaming = 4;
+  optional StreamStatusNotice streamStatusNotice = 36;
 }
 
 message Response {
@@ -149,12 +169,20 @@ export interface DecodedSensorData {
     value?: number;
 }
 
+export interface DecodedStreamStatusNotice {
+    detail?: {
+        code?: number;
+        reason?: string;
+    };
+}
+
 export interface DecodedMessage {
     type: 'KEEPALIVE' | 'REQUEST' | 'RESPONSE';
     request?: {
         id: number;
         type: string;
         sensorData?: DecodedSensorData[];
+        streamStatusNotice?: DecodedStreamStatusNotice;
     };
     response?: {
         requestId: number;

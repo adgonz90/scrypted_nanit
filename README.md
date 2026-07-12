@@ -44,6 +44,9 @@ Configure this under the plugin's own settings:
   If the camera is on a different VLAN/subnet than this host (e.g. an IoT VLAN), you'll need a
   firewall rule on your router allowing the camera to reach this host on the port below.
 - **Local Stream Port** - defaults to `1935`.
+- **Verbose Logging** - off by default. Turn on to also log high-frequency, low-value-by-default
+  messages (every sensor data push, device sync/lookup scaffolding) - useful when troubleshooting,
+  noisy otherwise.
 
 Per-camera, under that device's own settings:
 - **Keep Local Stream Connected** - off by default (matches the original on-demand/Battery

@@ -5,6 +5,8 @@ export interface ConnectionLogger {
     log(message: string): void;
     warn(message: string): void;
     error(message: string): void;
+    /** Gated by the plugin's "Verbose Logging" setting - for high-frequency, low-value-by-default messages. */
+    verbose(message: string): void;
 }
 
 type PendingRequest = {
@@ -177,9 +179,17 @@ export class NanitControlConnection {
 
         if (message.type === 'REQUEST' && message.request?.type === 'PUT_SENSOR_DATA') {
             for (const sensor of message.request.sensorData ?? []) {
-                this.logger.log(`${this.logPrefix} received sensor data: ${JSON.stringify(sensor)}`);
+                this.logger.verbose(`${this.logPrefix} received sensor data: ${JSON.stringify(sensor)}`);
                 this.onSensorData?.(sensor);
             }
+        }
+
+        // Diagnostic-only for now - just observing when/how often this shows up before deciding
+        // whether it's a reliable enough signal to act on. Not gated by verbose logging: it's rare
+        // and we specifically want it visible in normal captures while we're still characterizing it.
+        if (message.type === 'REQUEST' && message.request?.type === 'STREAM_STATUS_NOTICE') {
+            const detail = message.request.streamStatusNotice?.detail;
+            this.logger.log(`${this.logPrefix} received stream status notice: code=${detail?.code}, reason=${detail?.reason}`);
         }
     }
 
