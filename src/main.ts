@@ -1,22 +1,63 @@
-import { Battery, BinarySensor, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceDiscovery, DeviceProvider, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceProperty, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
+import { Battery, BinarySensor, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
 import { StorageSettings } from "@scrypted/sdk/storage-settings"
-import path from 'path';
 import axios, { AxiosRequestConfig } from 'axios'
-import { fail } from 'assert';
+import { NanitControlConnection } from './nanit/control-connection';
+import { LocalRtmpServer } from './nanit/local-rtmp-server';
+import { DecodedSensorData } from './nanit/proto';
+import { withTimestamps } from './nanit/timestamped-console';
 
-const { log, deviceManager, mediaManager } = sdk;
+const { deviceManager, mediaManager } = sdk;
 
+// How long a non-persistent (on-demand) local stream / control connection is kept around after
+// the last viewer disconnects, before we tear it down and go back to fully idle. Absorbs quick
+// reconnects (e.g. HomeKit re-requesting the stream a few seconds later) without re-paying the
+// PUT_STREAMING + camera redirect round trip every time.
+const ON_DEMAND_TEARDOWN_GRACE_MS = 15_000;
 
-class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, BinarySensor, Battery {
+interface NanitBaby {
+    uid: string;
+    name: string;
+    camera_uid: string;
+}
+
+class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, BinarySensor, Battery, Settings {
+    settingsStorage = new StorageSettings(this, {
+        persistentLocalStream: {
+            title: 'Keep Local Stream Connected',
+            description: 'Off (default): the local stream and its cloud control/signaling connection are only requested while something is actively viewing (matches this plugin\'s original Battery-camera behavior - lower footprint, no background motion/sound detection). On: the control connection stays open continuously so the local stream loads near-instantly and motion/sound detection work in the background. Only the lightweight control channel touches Nanit\'s cloud continuously either way - video itself stays on the LAN whenever a local stream is active.',
+            type: 'boolean',
+            defaultValue: false,
+            onPut: async () => this.plugin.applyDeviceMode(this.nativeId!),
+        },
+    });
+
     constructor(public plugin: NanitCameraPlugin, nativeId: string) {
         super(nativeId);
     }
 
+    private _timestampedConsole?: Console;
+    get console(): Console {
+        if (!this._timestampedConsole)
+            this._timestampedConsole = withTimestamps(super.console);
+        return this._timestampedConsole;
+    }
+
+    get persistentLocalStream(): boolean {
+        return !!this.settingsStorage.values.persistentLocalStream;
+    }
+
+    async getSettings(): Promise<Setting[]> {
+        return this.settingsStorage.getSettings();
+    }
+
+    async putSetting(key: string, value: SettingValue): Promise<void> {
+        return this.settingsStorage.putSetting(key, value);
+    }
+
     async takePicture(options?: PictureOptions): Promise<MediaObject> {
         this.console.log("trying to take a photo")
-        let ffmpegInputVal: FFmpegInput;
-        ffmpegInputVal = this.ffmpegInput(options);
+        const ffmpegInputVal = await this.buildFfmpegInput(options, true);
         ffmpegInputVal.videoDecoderArguments = ['-vframes', '1', '-q:v', '2']
         return mediaManager.createMediaObject(Buffer.from(JSON.stringify(ffmpegInputVal)), ScryptedMimeTypes.FFmpegInput);
     }
@@ -31,31 +72,49 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
         this.console.log("Attempting to confirm access token to retrieve video stream")
         await this.plugin.tryLogin();
         this.console.log("Login Succeeded. Returning video stream")
-        let ffmpegInputVal: FFmpegInput;
+        const ffmpegInputVal = await this.buildFfmpegInput(options);
+        return mediaManager.createMediaObject(Buffer.from(JSON.stringify(ffmpegInputVal)), ScryptedMimeTypes.FFmpegInput);
+    }
 
+    // Shared by getVideoStream() and takePicture(): prefers a local RTMP source and transparently
+    // falls back to the existing cloud RTMPS relay when local push isn't available. This is also
+    // what makes snapshots reliable - once a local low-latency source exists, the same "-vframes 1"
+    // ffmpeg args used for takePicture() work against it instead of the slow cloud
+    // handshake.
+    async buildFfmpegInput(options?: MediaStreamOptions, forSnapshot = false): Promise<FFmpegInput> {
         if (!this.nativeId) {
             throw new Error("missing nativeId");
         }
         if (!this.plugin.access_token) {
             throw new Error("missing access token");
         }
-        this.batteryLevel = 100;
-        ffmpegInputVal = this.ffmpegInput(options);
-        
 
-        return mediaManager.createMediaObject(Buffer.from(JSON.stringify(ffmpegInputVal)), ScryptedMimeTypes.FFmpegInput);
-    }
+        this.console.log(`[${this.nativeId}] attempting local stream before falling back to cloud`);
+        const localUrl = await this.plugin.ensureLocalStream(this.nativeId);
+        const url = localUrl ?? this.cloudStreamUrl();
 
-    ffmpegInput(options?: MediaStreamOptions): FFmpegInput {
-        this.console.log("Creating stream with camera:" + this.nativeId)
-        const file = "rtmps://media-secured.nanit.com/nanit/"+ this.nativeId! +"."+this.plugin.access_token;
+        if (localUrl)
+            this.console.log(`[${this.nativeId}] using LOCAL stream: ${localUrl}`);
+        else
+            this.console.log(`[${this.nativeId}] using CLOUD stream (see preceding log line for why local wasn't used): ${this.cloudStreamUrl().replace(this.plugin.access_token, '<redacted>')}`);
+
+        // Snapshot grabs were consistently getting killed by Scrypted's own snapshot timeout
+        // (~4-5s) before producing a frame. Our local RTMP source already sends header + cached
+        // GOP data immediately on connect (node-media-server's GOP cache), so there's no need for
+        // ffmpeg's much larger network-stream probing defaults for a single-frame grab - bound
+        // them down so ffmpeg can commit to a frame quickly instead of over-analyzing first.
+        const inputArguments = forSnapshot
+            ? ['-analyzeduration', '1000000', '-probesize', '1000000', '-i', url]
+            : ['-i', url];
 
         return {
             url: undefined,
-            inputArguments: [
-                '-i', file,
-            ]
+            inputArguments,
         };
+    }
+
+    cloudStreamUrl(): string {
+        return "rtmps://media-secured.nanit.com/nanit/" + this.nativeId! + "." + this.plugin.access_token;
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
@@ -70,10 +129,8 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
 
 
     async startIntercom(media: MediaObject): Promise<void> {
-        const ffmpegInput: FFmpegInput = JSON.parse((await mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput)).toString());
-        // something wants to start playback on the camera speaker.
-        // use their ffmpeg input arguments to spawn ffmpeg to do playback.
-        // some implementations read the data from an ffmpeg pipe output and POST to a url (like unifi/amcrest).
+        // Two-way audio (speaking to the camera) isn't implemented - the protocol for it hasn't
+        // been reverse-engineered yet.
         throw new Error('not implemented');
     }
 
@@ -93,6 +150,22 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
         this.motionDetected = true;
         setTimeout(() => this.motionDetected = false, 10000);
     }
+
+    // Fed by the camera's control-channel PUT_SENSOR_DATA pushes (only received while a control
+    // connection is open - i.e. reliably in "Keep Local Stream Connected" mode). isAlert as the
+    // trigger condition is inferred from the field name in Nanit's protocol, not yet confirmed
+    // against real hardware.
+    handleSensorData(sensor: DecodedSensorData) {
+        this.console.log(`[${this.nativeId}] sensor data: ${JSON.stringify(sensor)}`);
+        if (sensor.sensorType === 'MOTION' && sensor.isAlert) {
+            this.console.log(`[${this.nativeId}] triggering motion from sensor data`);
+            this.triggerMotion();
+        }
+        else if (sensor.sensorType === 'SOUND' && sensor.isAlert) {
+            this.console.log(`[${this.nativeId}] triggering sound/binary state from sensor data`);
+            this.triggerBinaryState();
+        }
+    }
 }
 
 class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings, DeviceCreator {
@@ -101,6 +174,18 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     mfa_token = '';
     failedCount = 0;
 
+    private _timestampedConsole?: Console;
+    get console(): Console {
+        if (!this._timestampedConsole)
+            this._timestampedConsole = withTimestamps(super.console);
+        return this._timestampedConsole;
+    }
+
+    cameraUidByNativeId = new Map<string, string>();
+    controlConnections = new Map<string, NanitControlConnection>();
+    teardownTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    pendingLocalStreamRequests = new Map<string, Promise<string | undefined>>();
+    rtmpServer?: LocalRtmpServer;
 
     settingsStorage = new StorageSettings(this, {
         email: {
@@ -121,7 +206,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 await this.syncDevices(0);
             },
             noStore: true,
-        }, 
+        },
         refresh_token: {
             title: 'refresh_token'
         },
@@ -131,6 +216,39 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
         expiration: {
             title: 'expiration',
             onPut: async () => this.syncDevices(0),
+        },
+        localStreamingEnabled: {
+            title: 'Enable Local Streaming',
+            description: 'When possible, receive the camera\'s video directly on the local network instead of round-tripping through Nanit\'s cloud relay. Requires "Local Stream Host" below and a firewall rule allowing the camera to reach this host. Falls back to the existing cloud stream automatically if local streaming cannot be established.',
+            type: 'boolean',
+            defaultValue: true,
+            onPut: async () => this.restartRtmpServer(),
+        },
+        localStreamHost: {
+            title: 'Local Stream Host',
+            description: 'LAN IP address of this Scrypted host, as reachable by the camera (they may be on different VLANs/subnets). Leave blank to use the first address from Settings > General > "Scrypted Server Addresses".',
+            type: 'string',
+            combobox: true,
+            onGet: async () => {
+                const addresses = await sdk.endpointManager.getLocalAddresses() ?? [];
+                return {
+                    choices: addresses,
+                    placeholder: addresses[0],
+                };
+            },
+        },
+        localStreamPort: {
+            title: 'Local Stream Port',
+            description: 'TCP port the local RTMP listener binds to, and that the camera is told to publish to.',
+            type: 'number',
+            defaultValue: 1935,
+            onPut: async () => this.restartRtmpServer(),
+        },
+        localStreamTimeout: {
+            title: 'Local Stream Confirm Timeout (ms)',
+            description: 'How long to wait for the camera to start publishing locally before falling back to the cloud stream for this view request. A cold start (fresh control connection, e.g. right after a plugin restart) can take longer than a warm one - keep this generous, since timing out unnecessarily means paying for a slow cloud fallback on top of this wait.',
+            type: 'number',
+            defaultValue: 8000,
         },
     });
 
@@ -145,7 +263,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             {
                 key: 'name',
                 title: 'Name',
-            }, 
+            },
             {
                 key: 'baby_uid',
                 title: 'baby_uid',
@@ -155,13 +273,15 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
 
     async createDevice(settings: DeviceCreatorSettings): Promise<string> {
         const nativeId = settings.baby_uid?.toString();
-        
+
         await deviceManager.onDeviceDiscovered({
             nativeId,
             type: ScryptedDeviceType.Camera,
             interfaces: [
                 ScryptedInterface.VideoCamera,
                 ScryptedInterface.Camera,
+                ScryptedInterface.Settings,
+                ScryptedInterface.Battery,
             ],
             name: settings.name?.toString(),
         });
@@ -174,7 +294,6 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     }
 
     clearAndTrySyncDevices() {
-        // add code to clear any r
         this.console.log("clearAndTrySyncDevices called");
         this.access_token = '';
         this.settingsStorage.putSetting("access_token", '');
@@ -182,13 +301,32 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     }
 
     async clearAndLogin() {
-        this.console.log("clearAndLogin called called");
+        this.console.log("clearAndLogin called");
         this.access_token = '';
         this.settingsStorage.putSetting("access_token", '');
         return this.tryLogin('');
     }
 
-    async tryLogin(twoFactorCode?: string) {
+    // Plugin start fans out several concurrent callers that all just want "a valid access token"
+    // (syncDevices, ensureLocalStream's camera_uid lookup, the control connection's auth callback,
+    // etc). Without sharing the in-flight attempt, each independently hits Nanit's login/babies
+    // endpoints at once, which measurably slowed down the cold-start local-stream path. Only the
+    // plain "just make sure we're logged in" call (twoFactorCode omitted entirely) is deduped -
+    // an explicit code (including clearAndLogin()'s forced-relogin call with '') is a distinct,
+    // one-off action and must never silently piggyback on an unrelated in-flight attempt that
+    // captured a stale token before it was cleared.
+    private tryLoginPromise?: Promise<void>;
+
+    async tryLogin(twoFactorCode?: string): Promise<void> {
+        if (twoFactorCode === undefined) {
+            if (!this.tryLoginPromise)
+                this.tryLoginPromise = this.tryLoginInternal(twoFactorCode).finally(() => this.tryLoginPromise = undefined);
+            return this.tryLoginPromise;
+        }
+        return this.tryLoginInternal(twoFactorCode);
+    }
+
+    private async tryLoginInternal(twoFactorCode?: string) {
         this.console.log("trying login...");
 
         const settings: Setting[] = await this.getSettings();
@@ -220,12 +358,12 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                     return (status >= 200 && status < 300) || status == 401; // default
                 }
             };
-    
-        
-    
+
+
+
             return axios.get("https://api.nanit.com/babies", authenticatedConfig).then((response) => {
                 //we are authenticated nothing to do
-        
+
                 if (response.status == 401 &&  this.failedCount < 2) {
                     this.console.log('failed to auth but received 401 so will clear tokens and try again')
                     this.failedCount++;
@@ -238,7 +376,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 }
             }).catch((error) => {
                 if (error.response.status == 401 &&  this.failedCount < 2) {
-                    this.console.log('OLD| SHOULD NOT EXECUTE | failed to auth but received 401 so will clear tokens and try again')
+                    this.console.log('failed to auth but received 401 so will clear tokens and try again')
                     this.failedCount++;
                     return this.clearAndLogin()
                 } else {
@@ -246,7 +384,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 }
             })
         }
-        
+
         const config = {
             headers:{
               "nanit-api-version": 1
@@ -269,7 +407,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
         if (!twoFactorCode || ! this.mfa_token) {
             this.console.log("calling the login api without mfa. will need to call again to get access/refresh token");
             return axios.post("https://api.nanit.com/login",{"email":email,"password":password},config).then((response) => {
-       
+
                 this.console.log("Login successful. setting mfa token and will recall login")
                 this.mfa_token = response.data.mfa_token;
             }).catch((error) => {
@@ -279,12 +417,12 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 } else {
                     this.console.log("Failed to talk to nanit"+ error);
                 }
-                
+
             });
         }
 
         this.console.log("calling the login api with mfa to get access and refresh token");
-    
+
         return axios.post("https://api.nanit.com/login",{"email":email,"password":password, "mfa_token":  this.mfa_token, "mfa_code": twoFactorCode},config).then((response) => {
             this.failedCount = 0;
                 this.console.log("response from email/pass/mfa login. Received new access token and refresh token")
@@ -296,7 +434,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 this.console.log("Failed to talk to nanit"+ error);
                 throw new Error(error.message)
            });
-        
+
     }
 
     getSettings(): Promise<Setting[]> {
@@ -307,8 +445,17 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
         return this.settingsStorage.putSetting(key, value);
     }
 
-    async syncDevices(duration: number) {
-        this.console.log("Sync Devices")
+    // Same rationale as tryLoginPromise above: syncDevices() and ensureLocalStream()'s camera_uid
+    // lookup can both want the babies list at the same moment on plugin start.
+    private fetchBabiesPromise?: Promise<NanitBaby[]>;
+
+    private async fetchBabies(): Promise<NanitBaby[]> {
+        if (!this.fetchBabiesPromise)
+            this.fetchBabiesPromise = this.fetchBabiesInternal().finally(() => this.fetchBabiesPromise = undefined);
+        return this.fetchBabiesPromise;
+    }
+
+    private async fetchBabiesInternal(): Promise<NanitBaby[]> {
         await this.tryLogin();
         const config = {
             headers:{
@@ -317,16 +464,23 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             }
         };
 
+        const babies: NanitBaby[] = (await axios.get("https://api.nanit.com/babies", config)).data.babies;
+        for (const baby of babies)
+            this.cameraUidByNativeId.set(baby.uid, baby.camera_uid);
+        return babies;
+    }
 
-        const babies: any[] = (await axios.get("https://api.nanit.com/babies", config)).data.babies;
+    async syncDevices(duration: number) {
+        this.console.log("Sync Devices")
+        const babies = await this.fetchBabies();
         const devices: Device[] = [];
         for (const camera of babies) {
             const nativeId = camera.uid;
             const interfaces = [
                 ScryptedInterface.Camera,
                 ScryptedInterface.VideoCamera,
-                ScryptedInterface.MotionSensor,
-                ScryptedInterface.Battery
+                ScryptedInterface.Settings,
+                ScryptedInterface.Battery,
             ];
 
             const device: Device = {
@@ -336,7 +490,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 },
                 nativeId,
                 name: camera.name,
-    
+
                 type: ScryptedDeviceType.Camera,
                 interfaces,
             };
@@ -349,18 +503,262 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
         this.console.log('discovered devices');
     }
 
+    // Recomputes and re-publishes a single device's declared interfaces after its
+    // "Keep Local Stream Connected" setting changes: dropping Battery once we no longer
+    // behave like an on-demand-only camera, and only claiming MotionSensor/BinarySensor once a
+    // persistent control connection actually exists to feed them.
+    async applyDeviceMode(nativeId: string) {
+        const device = this.devices.get(nativeId);
+        if (!device)
+            return;
+
+        // Battery is declared only in on-demand mode, and dropped entirely in persistent mode -
+        // matches the original plugin's convention (Battery = on-demand/low-footprint) and is
+        // also what Rebroadcast's prebuffer-mixin (plugins/prebuffer-mixin/src/main.ts,
+        // shouldDisableBatteryPrebuffer()) keys off of first: it returns null (falsy - prebuffer
+        // not disabled) the moment Battery isn't in the interfaces list at all, without even
+        // looking at Charger/chargeState/batteryLevel. So no Charger interface is needed here -
+        // it only matters for "Battery present but still want continuous prebuffer", which isn't
+        // our case. batteryLevel is set unconditionally since HomeKit's battery.ts only checks
+        // for the Battery interface's presence, not the level, to decide whether to show it.
+        const interfaces = [
+            ScryptedInterface.Camera,
+            ScryptedInterface.VideoCamera,
+            ScryptedInterface.Settings,
+        ];
+        if (device.persistentLocalStream)
+            interfaces.push(ScryptedInterface.MotionSensor, ScryptedInterface.BinarySensor);
+        else
+            interfaces.push(ScryptedInterface.Battery);
+
+        device.batteryLevel = 100;
+
+        this.console.log(`[${nativeId}] applying device mode: persistentLocalStream=${device.persistentLocalStream}, interfaces=[${interfaces.join(', ')}]`);
+        await deviceManager.onDeviceDiscovered({
+            nativeId,
+            type: ScryptedDeviceType.Camera,
+            interfaces,
+            name: device.name,
+        });
+
+        this.console.log(`[${nativeId}] device mode applied`);
+
+        if (device.persistentLocalStream) {
+            this.cancelScheduledTeardown(nativeId);
+            this.ensureLocalStream(nativeId).catch(err =>
+                this.console.warn(`failed to start persistent local stream for ${nativeId}: ${err.message}`));
+        }
+        else if (!this.rtmpServer?.subscriberCount(nativeId)) {
+            // Switching out of persistent mode with nobody currently watching - nothing will
+            // otherwise trigger the on-demand teardown (that normally fires off a donePlay event),
+            // so schedule it directly.
+            this.scheduleTeardown(nativeId);
+        }
+    }
+
     async getDevice(nativeId: string) {
         this.console.log("get device with id " + nativeId)
         if (!this.devices.has(nativeId)) {
             const camera = new NanitCameraDevice(this, nativeId);
-            
+
             this.devices.set(nativeId, camera);
+
+            // syncDevices() always (re)registers devices with the on-demand/Battery interface set
+            // regardless of the persisted "Keep Local Stream Connected" setting - without this,
+            // a plugin restart would silently revert a persistent-mode camera's declared
+            // interfaces back to Battery-only (dropping MotionSensor/BinarySensor) until the user
+            // happened to toggle the setting again, which is the only other thing that calls
+            // applyDeviceMode(). That mismatch is also why HomeKit Secure Video can disappear after
+            // a restart+re-pair: HomeKit negotiates accessory capabilities, including whether it
+            // has a motion sensor, at pairing time.
+            this.applyDeviceMode(nativeId).catch(err =>
+                this.console.warn(`[${nativeId}] failed to apply device mode on load: ${err.message}`));
         }
         return this.devices.get(nativeId);
     }
 
     async releaseDevice(id: string, nativeId: string): Promise<void> {
-        
+        this.cancelScheduledTeardown(nativeId);
+        this.controlConnections.get(nativeId)?.dispose();
+        this.controlConnections.delete(nativeId);
+        this.devices.delete(nativeId);
+    }
+
+    // ---- Local streaming ----
+
+    private getRtmpServer(): LocalRtmpServer {
+        if (!this.rtmpServer) {
+            const port = Number(this.settingsStorage.values.localStreamPort) || 1935;
+            const server = new LocalRtmpServer(port, this.console);
+
+            server.on('unhealthy', (streamKey: string) => {
+                const device = this.devices.get(streamKey);
+                if (!device)
+                    return;
+                // Camera's publish connection dropped. Re-request the redirect if we still care
+                // about this stream (persistent mode, or a viewer is still attached).
+                if (device.persistentLocalStream || server.subscriberCount(streamKey) > 0) {
+                    this.console.log(`[${streamKey}] local stream: publisher dropped, re-requesting (persistent=${device.persistentLocalStream}, subscribers=${server.subscriberCount(streamKey)})`);
+                    this.ensureLocalStream(streamKey).catch(err =>
+                        this.console.warn(`[${streamKey}] local stream: failed to re-establish after drop: ${err.message}`));
+                }
+                else {
+                    this.console.log(`[${streamKey}] local stream: publisher dropped, no active viewers - not re-requesting`);
+                }
+            });
+
+            server.on('subscribers', (streamKey: string, count: number) => {
+                if (count > 0)
+                    this.cancelScheduledTeardown(streamKey);
+                else
+                    this.scheduleTeardown(streamKey);
+            });
+
+            server.start();
+            this.rtmpServer = server;
+        }
+        return this.rtmpServer;
+    }
+
+    private restartRtmpServer() {
+        if (this.rtmpServer) {
+            this.rtmpServer.stop();
+            this.rtmpServer = undefined;
+        }
+    }
+
+    private getControlConnection(nativeId: string, cameraUid: string): NanitControlConnection {
+        let connection = this.controlConnections.get(nativeId);
+        if (!connection) {
+            connection = new NanitControlConnection(cameraUid, async () => {
+                await this.tryLogin();
+                return this.access_token;
+            }, this.console);
+            connection.onSensorData = sensor => this.devices.get(nativeId)?.handleSensorData(sensor);
+            this.controlConnections.set(nativeId, connection);
+        }
+        return connection;
+    }
+
+    private scheduleTeardown(nativeId: string) {
+        const device = this.devices.get(nativeId);
+        if (device?.persistentLocalStream)
+            return;
+        this.cancelScheduledTeardown(nativeId);
+        this.console.log(`[${nativeId}] local stream: no viewers, scheduling teardown in ${ON_DEMAND_TEARDOWN_GRACE_MS}ms if nothing else claims it first`);
+        this.teardownTimers.set(nativeId, setTimeout(async () => {
+            this.teardownTimers.delete(nativeId);
+            const connection = this.controlConnections.get(nativeId);
+            if (!connection)
+                return;
+            this.console.log(`[${nativeId}] local stream: teardown grace period elapsed, stopping local publish`);
+            const server = this.rtmpServer;
+            const host = await this.getLocalStreamHost();
+            const publishUrl = server && host ? server.getPublishUrl(host, nativeId) : undefined;
+            const stop = publishUrl ? connection.requestLocalStreaming(publishUrl, 'STOPPED') : Promise.resolve();
+            stop
+                .catch(err => this.console.warn(`failed to send STOPPED for ${nativeId}: ${err.message}`))
+                .finally(() => {
+                    connection.dispose();
+                    this.controlConnections.delete(nativeId);
+                });
+        }, ON_DEMAND_TEARDOWN_GRACE_MS));
+    }
+
+    private cancelScheduledTeardown(nativeId: string) {
+        const timer = this.teardownTimers.get(nativeId);
+        if (timer) {
+            clearTimeout(timer);
+            this.teardownTimers.delete(nativeId);
+            this.console.log(`[${nativeId}] local stream: scheduled teardown cancelled`);
+        }
+    }
+
+    // Falls back to Scrypted's own "Scrypted Server Addresses" (Settings > General) when the
+    // plugin's own Local Stream Host override is left blank, since that list already reflects
+    // the addresses this host is meant to be reached at.
+    private async getLocalStreamHost(): Promise<string | undefined> {
+        const configured = this.settingsStorage.values.localStreamHost as string;
+        if (configured)
+            return configured;
+        const addresses = await sdk.endpointManager.getLocalAddresses();
+        return addresses?.[0];
+    }
+
+    /**
+     * Attempts to get the camera to publish its RTMP stream directly to this host's local RTMP
+     * listener. Returns the local rtmp:// URL Scrypted's ffmpeg should read from once
+     * publishing is confirmed, or undefined if local streaming is disabled, unconfigured, or
+     * doesn't come up within the configured timeout - callers should fall back to the cloud
+     * stream URL in that case.
+     *
+     * Concurrent callers for the same camera (e.g. Scrypted prefetching a snapshot for several
+     * consumers at once on plugin load) share a single in-flight attempt instead of each firing
+     * their own PUT_STREAMING request - independent concurrent requests are exactly what tripped
+     * Nanit's "too many mobile app connections" limit in practice.
+     */
+    async ensureLocalStream(nativeId: string): Promise<string | undefined> {
+        const pending = this.pendingLocalStreamRequests.get(nativeId);
+        if (pending)
+            return pending;
+
+        const promise = this.ensureLocalStreamInternal(nativeId).finally(() => {
+            this.pendingLocalStreamRequests.delete(nativeId);
+        });
+        this.pendingLocalStreamRequests.set(nativeId, promise);
+        return promise;
+    }
+
+    private async ensureLocalStreamInternal(nativeId: string): Promise<string | undefined> {
+        const prefix = `[${nativeId}] local stream:`;
+
+        if (!this.settingsStorage.values.localStreamingEnabled) {
+            this.console.log(`${prefix} disabled in plugin settings, skipping (will use cloud)`);
+            return undefined;
+        }
+
+        const host = await this.getLocalStreamHost();
+        if (!host) {
+            this.console.warn(`${prefix} no Local Stream Host configured, and none could be auto-detected from Scrypted Server Addresses - falling back to cloud`);
+            return undefined;
+        }
+
+        let cameraUid = this.cameraUidByNativeId.get(nativeId);
+        if (!cameraUid) {
+            this.console.log(`${prefix} camera_uid not cached yet, fetching /babies`);
+            await this.fetchBabies();
+            cameraUid = this.cameraUidByNativeId.get(nativeId);
+        }
+        if (!cameraUid) {
+            this.console.warn(`${prefix} no camera_uid known for this device - falling back to cloud`);
+            return undefined;
+        }
+
+        const rtmp = this.getRtmpServer();
+        this.cancelScheduledTeardown(nativeId);
+
+        if (rtmp.isAlive(nativeId)) {
+            this.console.log(`${prefix} already publishing locally, reusing existing stream`);
+            return rtmp.getLocalPlaybackUrl(nativeId);
+        }
+
+        const timeoutMs = Number(this.settingsStorage.values.localStreamTimeout) || 8000;
+        const connection = this.getControlConnection(nativeId, cameraUid);
+        const publishUrl = rtmp.getPublishUrl(host, nativeId);
+
+        this.console.log(`${prefix} requesting camera to publish to ${publishUrl} (camera_uid ${cameraUid}, timeout ${timeoutMs}ms)`);
+        const alivePromise = rtmp.waitForAlive(nativeId, timeoutMs);
+        connection.requestLocalStreaming(publishUrl, 'STARTED').catch(err =>
+            this.console.warn(`${prefix} PUT_STREAMING request failed: ${err.message}`));
+
+        const becameAlive = await alivePromise;
+        if (becameAlive) {
+            this.console.log(`${prefix} camera is now publishing locally`);
+            return rtmp.getLocalPlaybackUrl(nativeId);
+        }
+
+        this.console.warn(`${prefix} camera did not start publishing within ${timeoutMs}ms - falling back to cloud`);
+        return undefined;
     }
 }
 
