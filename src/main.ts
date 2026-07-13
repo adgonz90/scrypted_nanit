@@ -1,4 +1,4 @@
-import { Battery, BinarySensor, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, HumiditySensor, Intercom, MediaObject, MediaStreamOptions, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, TemperatureUnit, Thermometer, VideoCamera } from '@scrypted/sdk';
+import { AudioSensor, Battery, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, HumiditySensor, Intercom, MediaObject, MediaStreamOptions, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, TemperatureUnit, Thermometer, VideoCamera } from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
 import { StorageSettings } from "@scrypted/sdk/storage-settings"
 import axios, { AxiosRequestConfig } from 'axios'
@@ -21,7 +21,7 @@ interface NanitBaby {
     camera_uid: string;
 }
 
-class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, BinarySensor, Battery, Thermometer, HumiditySensor, Settings {
+class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, AudioSensor, Battery, Thermometer, HumiditySensor, Settings {
     settingsStorage = new StorageSettings(this, {
         persistentLocalStream: {
             title: 'Keep Local Stream Connected',
@@ -150,9 +150,9 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
 
     // most cameras have have motion and doorbell press events, but dont notify when the event ends.
     // so set a timeout ourselves to reset the state.
-    triggerBinaryState() {
-        this.binaryState = true;
-        setTimeout(() => this.binaryState = false, 10000);
+    triggerAudioDetected() {
+        this.audioDetected = true;
+        setTimeout(() => this.audioDetected = false, 10000);
     }
 
     // most cameras have have motion and doorbell press events, but dont notify when the event ends.
@@ -175,8 +175,8 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
             this.triggerMotion();
         }
         else if (sensor.sensorType === 'SOUND' && sensor.isAlert) {
-            this.console.log(`[${this.nativeId}] triggering sound/binary state from sensor data`);
-            this.triggerBinaryState();
+            this.console.log(`[${this.nativeId}] triggering audio detected from sensor data`);
+            this.triggerAudioDetected();
         }
         else if (sensor.sensorType === 'TEMPERATURE' && sensor.valueMilli !== undefined) {
             // valueMilli is a milli-units reading (i.e. divide by 1000 for the actual value).
@@ -551,7 +551,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
 
     // Recomputes and re-publishes a single device's declared interfaces after its
     // "Keep Local Stream Connected" setting changes: dropping Battery once we no longer
-    // behave like an on-demand-only camera, and only claiming MotionSensor/BinarySensor once a
+    // behave like an on-demand-only camera, and only claiming MotionSensor/AudioSensor once a
     // persistent control connection actually exists to feed them.
     async applyDeviceMode(nativeId: string) {
         const device = this.devices.get(nativeId);
@@ -587,11 +587,11 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             ScryptedInterface.Settings,
         ];
         if (device.persistentLocalStream)
-            // MotionSensor/BinarySensor are only ever fed by the control channel's sensor-data
+            // MotionSensor/AudioSensor are only ever fed by the control channel's sensor-data
             // pushes while a control connection is kept open continuously - that's independent of
             // whether local *video* happens to be healthy right now, so this stays tied to the
             // setting alone, unlike the Battery decision above.
-            interfaces.push(ScryptedInterface.MotionSensor, ScryptedInterface.BinarySensor);
+            interfaces.push(ScryptedInterface.MotionSensor, ScryptedInterface.AudioSensor);
         if (!allowContinuousPrebuffer)
             interfaces.push(ScryptedInterface.Battery);
 
@@ -642,7 +642,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             // syncDevices() always (re)registers devices with the on-demand/Battery interface set
             // regardless of the persisted "Keep Local Stream Connected" setting - without this,
             // a plugin restart would silently revert a persistent-mode camera's declared
-            // interfaces back to Battery-only (dropping MotionSensor/BinarySensor) until the user
+            // interfaces back to Battery-only (dropping MotionSensor/AudioSensor) until the user
             // happened to toggle the setting again, which is the only other thing that calls
             // applyDeviceMode(). That mismatch is also why HomeKit Secure Video can disappear after
             // a restart+re-pair: HomeKit negotiates accessory capabilities, including whether it

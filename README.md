@@ -61,7 +61,7 @@ Per-camera, under that device's own settings:
 
 With "Keep Local Stream Connected" **off**, the device is still declared as a Battery camera in
 Scrypted, for the same reason as before: so Scrypted doesn't pre-buffer / stay connected 24/7.
-Turning it **on** drops the Battery interface and adds MotionSensor/BinarySensor - not because
+Turning it **on** drops the Battery interface and adds MotionSensor/AudioSensor - not because
 Nanit's own protocol reliably delivers motion/sound events over this channel (in practice it
 doesn't seem to), but so that a continuously-available local stream can feed a real motion
 detector (e.g. Scrypted's own Video Analysis plugin), which needs a stream to already be
