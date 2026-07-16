@@ -87,8 +87,10 @@ export class NanitControlConnection {
                 this.logger.log(`${this.logPrefix} connected`);
                 resolve();
                 // The camera may only start pushing PUT_SENSOR_DATA updates once something has
-                // asked, rather than doing so unprompted, so request it right after connecting.
+                // asked, rather than doing so unprompted, so request both of these right after
+                // connecting - see requestSensorDataTransfer() for why it's not enough on its own.
                 this.requestSensorData();
+                this.requestSensorDataTransfer();
             });
 
             ws.on('message', (data: Buffer, isBinary: boolean) => this.handleRawMessage(data, isBinary));
@@ -184,14 +186,17 @@ export class NanitControlConnection {
             }
         }
 
-        // Logged only, not acted on: in practice this notice consistently arrives several seconds
+        // Part of a WebRTC signaling channel this plugin doesn't otherwise use (see proto.ts) - only
+        // its streamStopped case is decoded, since that's the one that's actually shown up in
+        // practice. Logged only, not acted on: this notice consistently arrives several seconds
         // after LocalRtmpServer's own packet-freshness watchdog has already detected and recovered
         // from a stalled publish, and it can also fire with no corresponding publish interruption at
         // all - so it isn't a reliable enough signal to drive reconnect logic on its own. Not gated
         // by verbose logging since it's rare and worth keeping visible.
-        if (message.type === 'REQUEST' && message.request?.type === 'STREAM_STATUS_NOTICE') {
-            const detail = message.request.streamStatusNotice?.detail;
-            this.logger.log(`${this.logPrefix} received stream status notice: code=${detail?.code}, reason=${detail?.reason}`);
+        if (message.type === 'REQUEST' && message.request?.type === 'PUT_WEBRTC_SERVICE_MESSAGE') {
+            const streamStopped = message.request.webrtc?.streamStopped;
+            if (streamStopped)
+                this.logger.log(`${this.logPrefix} received WebRTC stream-stopped notice: state=${streamStopped.state}, statusMessage=${streamStopped.statusMessage}`);
         }
     }
 
@@ -203,6 +208,33 @@ export class NanitControlConnection {
         }
         catch (err) {
             this.logger.warn(`${this.logPrefix} GET_SENSOR_DATA request failed: ${(err as Error).message}`);
+        }
+    }
+
+    /**
+     * Enables continuous push delivery for each sensor type - see the comment on
+     * SensorDataTransfer in proto.ts. Doesn't affect which sensor types this plugin currently acts
+     * on (see handleSensorData() in main.ts), just whether the camera bothers sending them at all.
+     */
+    async requestSensorDataTransfer(): Promise<void> {
+        try {
+            await this.sendRequest('PUT_CONTROL', {
+                control: {
+                    sensorDataTransferEn: {
+                        sound: true,
+                        motion: true,
+                        temperature: true,
+                        humidity: true,
+                        light: true,
+                        night: true,
+                        cry: true,
+                    },
+                },
+            }, 10_000);
+            this.logger.log(`${this.logPrefix} requested sensor data transfer`);
+        }
+        catch (err) {
+            this.logger.warn(`${this.logPrefix} PUT_CONTROL sensorDataTransferEn request failed: ${(err as Error).message}`);
         }
     }
 

@@ -43,6 +43,12 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
         super(nativeId);
     }
 
+    // Timestamp of the most recent NIGHT sensor push (IR-cut relay / night-vision toggle). Used to
+    // suppress MOTION/SOUND/CRY events that share this exact timestamp, since the IR-cut relay's
+    // physical switch (or the IR flood light flicker) can itself spuriously trigger those sensors -
+    // see isIcrArtifact() below.
+    private lastNightEventTimestamp?: number;
+
     private _timestampedConsole?: Console;
     get console(): Console {
         if (!this._timestampedConsole)
@@ -162,19 +168,37 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
         setTimeout(() => this.motionDetected = false, 10000);
     }
 
+    // A MOTION/SOUND/CRY push whose timestamp exactly matches the most recent NIGHT push is treated
+    // as a spurious side effect of the IR-cut relay switching, not a real event, and suppressed.
+    private isIcrArtifact(sensor: DecodedSensorData): boolean {
+        return sensor.timestamp !== undefined && sensor.timestamp === this.lastNightEventTimestamp;
+    }
+
     // Fed by the camera's control-channel PUT_SENSOR_DATA pushes (only received while a control
-    // connection is open - i.e. reliably in "Keep Local Stream Connected" mode). The MOTION/SOUND
-    // branches are kept for protocol completeness but haven't been observed firing in practice -
-    // motion/sound notifications appear to be delivered through a separate push-notification
-    // channel instead, not this control connection. TEMPERATURE/HUMIDITY are confirmed working.
+    // connection is open - i.e. reliably in "Keep Local Stream Connected" mode). TEMPERATURE/
+    // HUMIDITY are confirmed working. MOTION/SOUND are kept for protocol completeness but haven't
+    // been observed firing in practice - motion/sound notifications appear to be delivered through
+    // a separate push-notification channel instead, not this control connection. The gating below
+    // (value/valueMilli for MOTION, no isAlert check for either) reflects reverse-engineered
+    // protocol behavior rather than a guess, in case that assumption turns out to be wrong.
     handleSensorData(sensor: DecodedSensorData) {
         if (this.plugin.verboseLogging)
             this.console.log(`[${this.nativeId}] sensor data: ${JSON.stringify(sensor)}`);
-        if (sensor.sensorType === 'MOTION' && sensor.isAlert) {
+        if (sensor.sensorType === 'NIGHT') {
+            this.lastNightEventTimestamp = sensor.timestamp;
+        }
+        // isAlert isn't a reliable gate for MOTION - instead this requires value === 2 (a discrete
+        // detection-level code, not a magnitude) and valueMilli < 350000 (likely a duration/score
+        // threshold in ms). Neither field is otherwise displayed or interpreted as a measurement.
+        else if (sensor.sensorType === 'MOTION' && !this.isIcrArtifact(sensor)
+            && sensor.value === 2 && (sensor.valueMilli ?? 0) < 350000) {
             this.console.log(`[${this.nativeId}] triggering motion from sensor data`);
             this.triggerMotion();
         }
-        else if (sensor.sensorType === 'SOUND' && sensor.isAlert) {
+        // isAlert isn't a reliable gate for SOUND either - just the ICR-artifact suppression above
+        // (a per-user notification-preference check would normally apply too, but this plugin has
+        // no equivalent setting for that).
+        else if (sensor.sensorType === 'SOUND' && !this.isIcrArtifact(sensor)) {
             this.console.log(`[${this.nativeId}] triggering audio detected from sensor data`);
             this.triggerAudioDetected();
         }

@@ -8,7 +8,8 @@ import protobuf from 'protobufjs';
 // RESPONSE messages for plenty of other request types (status, keepalive, etc) as part of its own
 // routine chatter, and protobufjs fails to decode a required enum field at all when the wire value
 // doesn't match any declared enum entry - trimming this enum down doesn't shrink what we handle, it
-// just makes otherwise-harmless messages fail to parse.
+// just makes otherwise-harmless messages fail to parse. Field numbers and enum values throughout this
+// file have been verified for accuracy rather than left as untested guesses.
 const PROTO_SOURCE = `
 syntax = "proto2";
 package client;
@@ -58,14 +59,11 @@ enum RequestType {
   PUT_TCP_REQUEST = 45;
   GET_STING_START = 46;
   GET_LOGS_URI = 47;
-
-  // Not documented in any publicly known schema for this protocol (the highest known value is 47) -
-  // reverse-engineered from 4 samples of otherwise-"malformed" messages this camera actually sent.
-  // Name/meaning is our own inference, not confirmed: every sample carried a nested string field
-  // reading "disconnected" (see StreamStatusNotice below) and arrived on the control channel a few
-  // seconds before our RTMP server's own TCP-level disconnect was observed. Kept distinct from a
-  // firm name like PUT_STREAM_DISCONNECTED until more samples confirm it's always disconnect-related.
-  STREAM_STATUS_NOTICE = 50;
+  PUT_SETUP_NETWORK_AP = 48;
+  PUT_REBOOT = 49;
+  PUT_WEBRTC_SERVICE_MESSAGE = 50;
+  GET_SAFE_ZONE_ROI = 51;
+  PUT_SAFE_ZONE_ROI = 52;
 }
 
 enum SensorType {
@@ -75,6 +73,13 @@ enum SensorType {
   HUMIDITY = 3;
   LIGHT = 4;
   NIGHT = 5;
+  SAFETY = 6;
+  CRY = 7;
+
+  // Undocumented - observed arriving as a second entry alongside a CRY push in the same message
+  // (sharing that entry's timestamp/timestampReal, always isAlert=false). Meaning unconfirmed;
+  // named generically rather than guessed so decoding doesn't fail on it like CRY once did.
+  UNKNOWN_8 = 8;
 }
 
 message SensorData {
@@ -83,6 +88,11 @@ message SensorData {
   optional int32 timestamp = 5;
   optional int32 valueMilli = 6;
   optional int32 value = 3;
+
+  // Higher-precision companion to timestamp above (observed as timestamp*1000 plus a sub-second
+  // remainder). Decoded but not currently used for anything - the 10s auto-reset window in
+  // triggerAudioDetected()/triggerMotion() doesn't need sub-second precision.
+  optional int64 timestampReal = 7;
 }
 
 message GetSensorData {
@@ -91,6 +101,24 @@ message GetSensorData {
   optional bool humidity = 5;
   optional bool light = 6;
   optional bool night = 7;
+}
+
+// GET_SENSOR_DATA{all: true} above only returns a one-time snapshot. Sending this as well is what
+// actually turns on continuous push delivery for each sensor type (TEMPERATURE/HUMIDITY appear to
+// be pushed regardless, but SOUND/MOTION/CRY may not be without this).
+message SensorDataTransfer {
+  optional bool sound = 1;
+  optional bool motion = 2;
+  optional bool temperature = 3;
+  optional bool humidity = 4;
+  optional bool light = 5;
+  optional bool night = 6;
+  optional bool safeZone = 7;
+  optional bool cry = 8;
+}
+
+message Control {
+  optional SensorDataTransfer sensorDataTransferEn = 4;
 }
 
 enum StreamIdentifier {
@@ -113,15 +141,25 @@ message Streaming {
   optional int32 attempts = 4;
 }
 
-// Reverse-engineered structure backing STREAM_STATUS_NOTICE above - field numbers and nesting
-// confirmed byte-for-byte against real wire captures, but names/semantics are our own guess.
-message StreamStatusDetail {
-  optional int64 code = 1;
-  optional string reason = 3;
+// WebRTC signaling envelope (SDP offers/answers, ICE candidates, and the stream-stopped notice
+// below) used for a separate, newer streaming path this plugin doesn't use. Only the
+// streamStopped case is modeled here - the other cases (remoteDescription, localOffer,
+// localDescription, stopStream, iceCandidate) are left undeclared and simply skipped on decode,
+// same as any other field this plugin doesn't need.
+enum WebRtcStreamStoppedState {
+  ON_REQUEST = 1;
+  DISCONNECTED = 2;
+  FAILED = 3;
+  ERROR = 4;
 }
 
-message StreamStatusNotice {
-  optional StreamStatusDetail detail = 3;
+message WebRtcStreamStopped {
+  optional WebRtcStreamStoppedState state = 2;
+  optional string statusMessage = 3;
+}
+
+message WebRtc {
+  optional WebRtcStreamStopped streamStopped = 5;
 }
 
 message Request {
@@ -132,7 +170,8 @@ message Request {
   repeated SensorData sensorData = 13;
 
   optional Streaming streaming = 4;
-  optional StreamStatusNotice streamStatusNotice = 36;
+  optional Control control = 15;
+  optional WebRtc webrtc = 36;
 }
 
 message Response {
@@ -162,18 +201,17 @@ const MessageType = root.lookupType('client.Message');
 const decodeOpts: protobuf.IConversionOptions = { enums: String, longs: Number, defaults: true, arrays: true };
 
 export interface DecodedSensorData {
-    sensorType: 'SOUND' | 'MOTION' | 'TEMPERATURE' | 'HUMIDITY' | 'LIGHT' | 'NIGHT';
+    sensorType: 'SOUND' | 'MOTION' | 'TEMPERATURE' | 'HUMIDITY' | 'LIGHT' | 'NIGHT' | 'SAFETY' | 'CRY' | 'UNKNOWN_8';
     isAlert?: boolean;
     timestamp?: number;
     valueMilli?: number;
     value?: number;
+    timestampReal?: number;
 }
 
-export interface DecodedStreamStatusNotice {
-    detail?: {
-        code?: number;
-        reason?: string;
-    };
+export interface DecodedWebRtcStreamStopped {
+    state?: 'ON_REQUEST' | 'DISCONNECTED' | 'FAILED' | 'ERROR';
+    statusMessage?: string;
 }
 
 export interface DecodedMessage {
@@ -182,7 +220,9 @@ export interface DecodedMessage {
         id: number;
         type: string;
         sensorData?: DecodedSensorData[];
-        streamStatusNotice?: DecodedStreamStatusNotice;
+        webrtc?: {
+            streamStopped?: DecodedWebRtcStreamStopped;
+        };
     };
     response?: {
         requestId: number;
