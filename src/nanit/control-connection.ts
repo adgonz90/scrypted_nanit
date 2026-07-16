@@ -165,6 +165,11 @@ export class NanitControlConnection {
             return;
         }
 
+        // Every successfully-decoded message, regardless of type - useful for spotting message
+        // types/fields this plugin doesn't otherwise handle or log, the same way the malformed-
+        // message hex above helps with ones that fail to decode at all.
+        this.logger.verbose(`${this.logPrefix} received control message (${data.length} bytes, hex: ${data.toString('hex')}): ${JSON.stringify(message)}`);
+
         if (message.type === 'RESPONSE' && message.response) {
             const { requestId, requestType, statusCode, statusMessage } = message.response;
             const pending = this.pending.get(requestId);
