@@ -141,6 +141,23 @@ message Streaming {
   optional int32 attempts = 4;
 }
 
+// Two-way audio, the reverse direction of Streaming above: instead of the camera publishing to
+// a URL we give it, we publish audio and this tells the camera where to connect and play it.
+// PAUSED is included defensively even though only STARTED/STOPPED are confirmed for this specific
+// message (unlike Streaming.Status above) - status is a required field, so an unrecognized value
+// here would otherwise fail the whole message to decode, the same class of bug CRY once hit.
+message AudioStreaming {
+  enum Status {
+    STARTED = 0;
+    STOPPED = 1;
+    PAUSED = 2;
+  }
+
+  required Status status = 1;
+  optional string rtmpUrl = 2;
+  optional string sessionId = 3;
+}
+
 // WebRTC signaling envelope (SDP offers/answers, ICE candidates, and the stream-stopped notice
 // below) used for a separate, newer streaming path this plugin doesn't use. Only the
 // streamStopped case is modeled here - the other cases (remoteDescription, localOffer,
@@ -171,6 +188,7 @@ message Request {
 
   optional Streaming streaming = 4;
   optional Control control = 15;
+  optional AudioStreaming audioStreaming = 20;
   optional WebRtc webrtc = 36;
 }
 
@@ -181,6 +199,7 @@ message Response {
   optional string statusMessage = 4;
 
   repeated SensorData sensorData = 9;
+  optional AudioStreaming audioStreaming = 20;
 }
 
 message Message {
@@ -214,12 +233,19 @@ export interface DecodedWebRtcStreamStopped {
     statusMessage?: string;
 }
 
+export interface DecodedAudioStreaming {
+    status: 'STARTED' | 'STOPPED' | 'PAUSED';
+    rtmpUrl?: string;
+    sessionId?: string;
+}
+
 export interface DecodedMessage {
     type: 'KEEPALIVE' | 'REQUEST' | 'RESPONSE';
     request?: {
         id: number;
         type: string;
         sensorData?: DecodedSensorData[];
+        audioStreaming?: DecodedAudioStreaming;
         webrtc?: {
             streamStopped?: DecodedWebRtcStreamStopped;
         };

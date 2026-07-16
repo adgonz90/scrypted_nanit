@@ -29,6 +29,14 @@ export interface RtmpServerLogger {
 // when told where to publish. The stream key underneath it is the Nanit baby UID.
 const RTMP_APP = 'local';
 
+// App name for two-way audio - the reverse direction of RTMP_APP above. There, the camera
+// publishes video and we play it; here, we publish audio (fed from Scrypted's own Intercom
+// input) and the camera plays it instead. Sharing this same node-media-server instance/port
+// rather than standing up a second server keeps the firewall/port footprint identical to what's
+// already documented for local video streaming - node-media-server has no app-name allowlist, so
+// no extra config is needed to accept publishes/plays under a second app name.
+const TWO_WAY_AUDIO_APP = '2wa';
+
 // How often to check for stalled publishers, and how long a publisher can go without sending a
 // single A/V packet before we consider it dead. A camera that loses power or network connectivity
 // mid-stream never sends a TCP FIN, so node-media-server's own donePublish never fires - observed
@@ -45,14 +53,18 @@ interface RtmpSession {
 }
 
 /**
- * Thin wrapper around a single shared node-media-server instance that acts purely as a local
- * RTMP ingest point - no HTTP/HLS/flv surface is enabled, since Scrypted's own ffmpeg process
- * reads the stream directly over RTMP, the same way it reads the cloud RTMPS URL.
+ * Thin wrapper around a single shared node-media-server instance - no HTTP/HLS/flv surface is
+ * enabled, since Scrypted's own ffmpeg process reads/writes RTMP directly, the same way it reads
+ * the cloud RTMPS URL. Mostly a local RTMP ingest point for video (the camera publishes, we
+ * play), but also used the other way around for two-way audio (we publish, the camera plays) -
+ * see the alive/unhealthy/subscribers tracking below vs. getTwoWayAudioPublishUrl()/
+ * getTwoWayAudioPlayUrl(), which intentionally has none of that: we control our own audio
+ * publish process directly and don't need node-media-server events to know its state.
  *
  * Shared across every camera device (one TCP listener, one port), so per-stream-key state is
  * tracked here and callers key off the Nanit baby UID used as the RTMP stream name.
  *
- * Events:
+ * Events (video ingest only):
  *  - 'alive' (streamKey)              - a publisher started publishing this stream key
  *  - 'unhealthy' (streamKey)          - the publisher for this stream key disconnected
  *  - 'subscribers' (streamKey, count) - the number of local players/subscribers changed
@@ -214,6 +226,16 @@ export class LocalRtmpServer extends EventEmitter {
     /** URL Scrypted's own ffmpeg process reads from, always loopback since it runs alongside this server. */
     getLocalPlaybackUrl(streamKey: string): string {
         return `rtmp://127.0.0.1:${this.port}/${RTMP_APP}/${streamKey}`;
+    }
+
+    /** URL Scrypted's own ffmpeg process publishes two-way audio to, always loopback. */
+    getTwoWayAudioPublishUrl(streamKey: string): string {
+        return `rtmp://127.0.0.1:${this.port}/${TWO_WAY_AUDIO_APP}/${streamKey}`;
+    }
+
+    /** URL the camera should be told (via PUT_AUDIO_STREAMING) to connect to and play. */
+    getTwoWayAudioPlayUrl(publicHost: string, streamKey: string): string {
+        return `rtmp://${publicHost}:${this.port}/${TWO_WAY_AUDIO_APP}/${streamKey}`;
     }
 
     stop() {

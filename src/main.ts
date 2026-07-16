@@ -2,6 +2,8 @@ import { AudioSensor, Battery, Camera, Device, DeviceCreator, DeviceCreatorSetti
 import sdk from '@scrypted/sdk';
 import { StorageSettings } from "@scrypted/sdk/storage-settings"
 import axios, { AxiosRequestConfig } from 'axios'
+import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import { randomUUID } from 'crypto';
 import { NanitControlConnection } from './nanit/control-connection';
 import { LocalRtmpServer } from './nanit/local-rtmp-server';
 import { DecodedSensorData } from './nanit/proto';
@@ -146,12 +148,15 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
 
 
     async startIntercom(media: MediaObject): Promise<void> {
-        // Two-way audio (speaking to the camera) isn't implemented - the protocol for it hasn't
-        // been reverse-engineered yet.
-        throw new Error('not implemented');
+        if (!this.nativeId)
+            throw new Error('missing nativeId');
+        await this.plugin.startTwoWayAudio(this.nativeId, media);
     }
 
     async stopIntercom(): Promise<void> {
+        if (!this.nativeId)
+            return;
+        await this.plugin.stopTwoWayAudio(this.nativeId);
     }
 
     // most cameras have have motion and doorbell press events, but dont notify when the event ends.
@@ -243,6 +248,9 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     teardownTimers = new Map<string, ReturnType<typeof setTimeout>>();
     pendingLocalStreamRequests = new Map<string, Promise<string | undefined>>();
     rtmpServer?: LocalRtmpServer;
+    twoWayAudioProcesses = new Map<string, ChildProcessWithoutNullStreams>();
+    twoWayAudioSessionIds = new Map<string, string>();
+    pendingTwoWayAudioRequests = new Map<string, Promise<void>>();
 
     settingsStorage = new StorageSettings(this, {
         email: {
@@ -347,6 +355,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             interfaces: [
                 ScryptedInterface.VideoCamera,
                 ScryptedInterface.Camera,
+                ScryptedInterface.Intercom,
                 ScryptedInterface.Settings,
                 ScryptedInterface.Battery,
             ],
@@ -548,6 +557,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             const interfaces = [
                 ScryptedInterface.Camera,
                 ScryptedInterface.VideoCamera,
+                ScryptedInterface.Intercom,
                 ScryptedInterface.Settings,
                 ScryptedInterface.Battery,
             ];
@@ -608,6 +618,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
         const interfaces = [
             ScryptedInterface.Camera,
             ScryptedInterface.VideoCamera,
+            ScryptedInterface.Intercom,
             ScryptedInterface.Settings,
         ];
         if (device.persistentLocalStream)
@@ -913,6 +924,169 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
 
         this.console.warn(`${prefix} camera did not start publishing within ${timeoutMs}ms - falling back to cloud`);
         return undefined;
+    }
+
+    // ---- Two-way audio ----
+
+    // Confirmed against real HomeKit behavior: startIntercom()/stopIntercom() are called once per
+    // camera-view session (open/close), not once per tap of the Home app's talk button. Toggling
+    // talk on/off mid-session never reaches this plugin at all - HomeKit just stops/resumes
+    // feeding RTP packets into the local RTSP relay it already handed us in media, which we only
+    // ever see indirectly as our own ffmpeg process stalling and resuming (visible in its verbose
+    // progress log as a gap in timestamps and a "speed=" far below 1.0x right after). So a single
+    // start/stop pair spanning several talk toggles is expected, not a sign anything was missed.
+    //
+    // Also confirmed: HomeKit runs one independent streaming session per paired controller (each
+    // phone/HomeHub viewing this camera gets its own RTP session - see Scrypted's own HomeKit
+    // plugin, camera-streaming.ts), and each one calls startIntercom()/stopIntercom() on this same
+    // device independently with no coordination between them. Only one session's audio can
+    // actually be flowing here at a time (this plugin, like every other Scrypted camera plugin
+    // that implements Intercom - Ring, UniFi Protect, ONVIF, bticino - keeps a single shared
+    // "current session" slot, not one per caller), so a second concurrent viewer starting an
+    // intercom session silently tears down and replaces whatever the first one had going, with no
+    // signal back to the first caller that it was pre-empted. This matches the de facto standard
+    // across the whole Scrypted plugin ecosystem - nothing in Intercom's own interface definition
+    // or HomeKit's session handling addresses concurrent callers, and no existing plugin does
+    // anything more sophisticated - so it's left as-is rather than inventing a new pattern. A
+    // single camera speaker can only usefully play one talker's audio at once anyway.
+
+    /**
+     * Starts publishing media (an Intercom audio source, e.g. HomeKit's own RTP mic bridge) to
+     * the camera - the reverse of ensureLocalStream() above: there the camera publishes video to
+     * us, here we publish audio and tell the camera where to connect and play it. Local-only for
+     * now, with no cloud/remote fallback - unlike video, publishing audio through Nanit's own
+     * relay hasn't been attempted, so this simply fails if local delivery isn't possible.
+     *
+     * Concurrent callers for the same device share the one in-flight attempt instead of each
+     * spawning their own ffmpeg process and sending their own PUT_AUDIO_STREAMING - same reasoning
+     * as ensureLocalStream()'s equivalent guard: independent concurrent starts would each publish
+     * their own audio and hand the camera a different session ID, leaking whichever ffmpeg process
+     * loses the race to have its state overwritten and leaving the camera uncertain which session
+     * is actually current.
+     */
+    async startTwoWayAudio(nativeId: string, media: MediaObject): Promise<void> {
+        const pending = this.pendingTwoWayAudioRequests.get(nativeId);
+        if (pending) {
+            this.console.log(`[${nativeId}] two-way audio: start already in flight, joining it instead of starting a duplicate session`);
+            return pending;
+        }
+
+        const promise = this.startTwoWayAudioInternal(nativeId, media).finally(() => {
+            this.pendingTwoWayAudioRequests.delete(nativeId);
+        });
+        this.pendingTwoWayAudioRequests.set(nativeId, promise);
+        return promise;
+    }
+
+    private async startTwoWayAudioInternal(nativeId: string, media: MediaObject): Promise<void> {
+        this.console.log(`[${nativeId}] two-way audio: starting`);
+        await this.stopTwoWayAudio(nativeId);
+
+        if (!this.settingsStorage.values.localStreamingEnabled)
+            throw new Error(`[${nativeId}] two-way audio: local streaming is disabled in plugin settings`);
+
+        const cameraUid = await this.getCameraUid(nativeId);
+        if (!cameraUid)
+            throw new Error(`[${nativeId}] two-way audio: no camera_uid known for this device`);
+        const host = await this.getLocalStreamHost();
+        if (!host)
+            throw new Error(`[${nativeId}] two-way audio: no Local Stream Host configured`);
+
+        const rtmp = this.getRtmpServer();
+        const sessionId = randomUUID();
+        const publishUrl = rtmp.getTwoWayAudioPublishUrl(nativeId);
+        const playUrl = rtmp.getTwoWayAudioPlayUrl(host, nativeId);
+
+        const ffmpegInput = await mediaManager.convertMediaObjectToJSON<FFmpegInput>(media, ScryptedMimeTypes.FFmpegInput);
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+        if (this.verboseLogging)
+            this.console.log(`[${nativeId}] two-way audio: received ffmpeg input: ${JSON.stringify(ffmpegInput)}`);
+
+        // ffmpegInput.inputArguments is a complete, ready-to-use ffmpeg input clause (includes its
+        // own -i) - Scrypted's HomeKit plugin already terminates the SRTP session from the Home
+        // app itself and re-serves the audio as a local RTSP stream, with the correct -acodec
+        // (almost always Opus - Scrypted forces Opus over AAC-ELD for talkback by default) already
+        // included. So the *input* codec here isn't something we choose or need to guess.
+        //
+        // The *output* format below (AAC/44100Hz/mono) is what we transcode to for the camera's
+        // side - that part isn't confirmed for this direction specifically, but it's not a blind
+        // guess either: the camera's own downstream audio (the RTMP video stream's audio track) is
+        // aac/44100Hz/mono/24kbps, and Nanit's own two-way audio mic capture also records at
+        // 44100Hz mono - both independently pointing at the same format, unlike the original 8kHz
+        // guess this comment used to describe.
+        const args = [
+            '-hide_banner',
+            ...(ffmpegInput.inputArguments ?? []),
+            '-vn', '-sn', '-dn',
+            '-acodec', 'aac',
+            '-ar', '44100',
+            '-ac', '1',
+            '-b:a', '24k',
+            '-f', 'flv',
+            publishUrl,
+        ];
+
+        this.console.log(`[${nativeId}] two-way audio: starting ffmpeg publish to ${publishUrl}`);
+        if (this.verboseLogging)
+            this.console.log(`[${nativeId}] two-way audio: ffmpeg args: ${JSON.stringify(args)}`);
+        const ffmpeg = spawn(ffmpegPath, args);
+        this.twoWayAudioProcesses.set(nativeId, ffmpeg);
+        ffmpeg.stderr.on('data', data => {
+            if (this.verboseLogging)
+                this.console.log(`[${nativeId}] two-way audio ffmpeg: ${data}`);
+        });
+        ffmpeg.on('error', err => {
+            this.console.warn(`[${nativeId}] two-way audio: ffmpeg process error: ${err.message}`);
+        });
+        ffmpeg.on('exit', code => {
+            this.console.log(`[${nativeId}] two-way audio ffmpeg exited (code ${code})`);
+            if (this.twoWayAudioProcesses.get(nativeId) === ffmpeg)
+                this.twoWayAudioProcesses.delete(nativeId);
+        });
+
+        const connection = this.getControlConnection(nativeId, cameraUid);
+        this.twoWayAudioSessionIds.set(nativeId, sessionId);
+        try {
+            // requestTwoWayAudio() already logs the camera's own confirmation once it resolves -
+            // nothing more to add at this layer.
+            await connection.requestTwoWayAudio(playUrl, sessionId, 'STARTED');
+        }
+        catch (err) {
+            this.console.warn(`[${nativeId}] two-way audio: failed to start: ${(err as Error).message}`);
+            await this.stopTwoWayAudio(nativeId);
+            throw err;
+        }
+    }
+
+    /** Stops any in-progress two-way audio session for this device, if one exists. Safe to call even if none is active. */
+    async stopTwoWayAudio(nativeId: string): Promise<void> {
+        const ffmpeg = this.twoWayAudioProcesses.get(nativeId);
+        const sessionId = this.twoWayAudioSessionIds.get(nativeId);
+        if (!ffmpeg && !sessionId) {
+            if (this.verboseLogging)
+                this.console.log(`[${nativeId}] two-way audio: stop requested but nothing is active`);
+            return;
+        }
+
+        this.console.log(`[${nativeId}] two-way audio: stopping`);
+        if (ffmpeg) {
+            this.twoWayAudioProcesses.delete(nativeId);
+            ffmpeg.kill();
+        }
+
+        this.twoWayAudioSessionIds.delete(nativeId);
+        if (!sessionId)
+            return;
+
+        const connection = this.controlConnections.get(nativeId);
+        const host = await this.getLocalStreamHost();
+        if (!connection || !this.rtmpServer || !host) {
+            this.console.warn(`[${nativeId}] two-way audio: stopping locally, but could not notify the camera (missing control connection, RTMP server, or local stream host) - it may keep trying to pull audio until its own timeout`);
+            return;
+        }
+        const playUrl = this.rtmpServer.getTwoWayAudioPlayUrl(host, nativeId);
+        await connection.requestTwoWayAudio(playUrl, sessionId, 'STOPPED').catch(err =>
+            this.console.warn(`[${nativeId}] two-way audio: failed to send STOPPED: ${(err as Error).message}`));
     }
 }
 

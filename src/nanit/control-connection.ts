@@ -16,6 +16,17 @@ type PendingRequest = {
     timer: ReturnType<typeof setTimeout>;
 };
 
+type PendingAudioConfirmation = {
+    resolve: () => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+};
+
+// How long to wait for the camera's own follow-up PUT_AUDIO_STREAMING request confirming it
+// actually started pulling two-way audio, after our own request was acknowledged - see
+// requestTwoWayAudio() for why this is a separate wait from the request/response round trip.
+const TWO_WAY_AUDIO_CONFIRM_TIMEOUT_MS = 10_000;
+
 // Special-cased because it's a non-fatal, expected condition: too many concurrent viewers on
 // Nanit's backend, not a real failure. Retrying immediately in a loop against this error is what
 // triggers the "app connections above limit" lockout in the first place, so back off well past the
@@ -38,6 +49,7 @@ export class NanitControlConnection {
     private reconnectAttempt = 0;
     private lastRequestId = 0;
     private pending = new Map<number, PendingRequest>();
+    private pendingAudioConfirmations = new Map<string, PendingAudioConfirmation>();
     private connectPromise?: Promise<void>;
     private disposed = false;
     private inFlightStreamingRequest?: { status: string, promise: Promise<void> };
@@ -191,6 +203,24 @@ export class NanitControlConnection {
             }
         }
 
+        // The camera's own confirmation that it's actually connected and pulling two-way audio -
+        // see requestTwoWayAudio() for why this (not the initial request/response round trip) is
+        // what resolves that promise.
+        if (message.type === 'REQUEST' && message.request?.type === 'PUT_AUDIO_STREAMING') {
+            const audioStreaming = message.request.audioStreaming;
+            if (audioStreaming?.sessionId) {
+                this.logger.log(`${this.logPrefix} received PUT_AUDIO_STREAMING ${audioStreaming.status} for session ${audioStreaming.sessionId}`);
+                if (audioStreaming.status === 'STARTED') {
+                    const pending = this.pendingAudioConfirmations.get(audioStreaming.sessionId);
+                    if (pending) {
+                        clearTimeout(pending.timer);
+                        this.pendingAudioConfirmations.delete(audioStreaming.sessionId);
+                        pending.resolve();
+                    }
+                }
+            }
+        }
+
         // Part of a WebRTC signaling channel this plugin doesn't otherwise use (see proto.ts) - only
         // its streamStopped case is decoded, since that's the one that's actually shown up in
         // practice. Logged only, not acted on: this notice consistently arrives several seconds
@@ -243,6 +273,41 @@ export class NanitControlConnection {
         }
     }
 
+    /**
+     * Requests that the camera start/stop pulling two-way audio from rtmpUrl, correlated by
+     * sessionId. Mirrors requestLocalStreaming(), but for the reversed direction: there we tell
+     * the camera where to publish video to us; here we publish audio ourselves and tell the
+     * camera where to connect and play it.
+     *
+     * For STARTED, this resolves only once the camera's own follow-up PUT_AUDIO_STREAMING request
+     * confirms it actually connected (handled in handleRawMessage()) - the response to our own
+     * request just means the command was received, not that a connection was established. This is
+     * the same two-step confirmation PUT_STREAMING gets from an RTMP-level 'postPublish' event;
+     * two-way audio has no equivalent event we can observe locally, so this relies on the camera's
+     * own ack instead.
+     */
+    async requestTwoWayAudio(rtmpUrl: string, sessionId: string, status: 'STARTED' | 'STOPPED'): Promise<void> {
+        this.logger.log(`${this.logPrefix} requesting PUT_AUDIO_STREAMING ${status} -> ${rtmpUrl} (session ${sessionId})`);
+        await this.ensureConnected();
+
+        await this.sendRequest('PUT_AUDIO_STREAMING', {
+            audioStreaming: { status, rtmpUrl, sessionId },
+        }, 10_000);
+        this.logger.log(`${this.logPrefix} camera acknowledged PUT_AUDIO_STREAMING ${status} command`);
+
+        if (status !== 'STARTED')
+            return;
+
+        await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.pendingAudioConfirmations.delete(sessionId);
+                reject(new Error(`timed out after ${TWO_WAY_AUDIO_CONFIRM_TIMEOUT_MS}ms waiting for camera to confirm it started pulling two-way audio`));
+            }, TWO_WAY_AUDIO_CONFIRM_TIMEOUT_MS);
+            this.pendingAudioConfirmations.set(sessionId, { resolve, reject, timer });
+        });
+        this.logger.log(`${this.logPrefix} camera confirmed two-way audio session ${sessionId} started`);
+    }
+
     private sendRequest(requestType: string, body: Record<string, unknown>, timeoutMs: number): Promise<string | undefined> {
         const id = ++this.lastRequestId;
         return new Promise((resolve, reject) => {
@@ -256,7 +321,13 @@ export class NanitControlConnection {
             try {
                 if (!this.isConnected)
                     throw new Error('control websocket is not connected');
-                this.ws!.send(encodeControlMessage({ type: 'REQUEST', request: { id, type: requestType, ...body } }));
+                const payload = { type: 'REQUEST', request: { id, type: requestType, ...body } };
+                const encoded = encodeControlMessage(payload);
+                // Mirrors the blanket log for incoming messages in handleRawMessage() - full
+                // visibility into everything sent, not just the high-level summary each caller
+                // logs on its own (e.g. requestLocalStreaming()'s "requesting PUT_STREAMING...").
+                this.logger.verbose(`${this.logPrefix} sending control message (${encoded.length} bytes, hex: ${encoded.toString('hex')}): ${JSON.stringify(payload)}`);
+                this.ws!.send(encoded);
             }
             catch (err) {
                 clearTimeout(timer);
@@ -328,5 +399,10 @@ export class NanitControlConnection {
             pending.reject(err);
         }
         this.pending.clear();
+        for (const pending of this.pendingAudioConfirmations.values()) {
+            clearTimeout(pending.timer);
+            pending.reject(err);
+        }
+        this.pendingAudioConfirmations.clear();
     }
 }
