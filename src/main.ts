@@ -506,6 +506,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     twoWayAudioProcesses = new Map<string, ChildProcessWithoutNullStreams>();
     twoWayAudioSessionIds = new Map<string, string>();
     pendingTwoWayAudioRequests = new Map<string, Promise<void>>();
+    pendingSettingsRequests = new Map<string, Promise<DecodedSettings | undefined>>();
 
     settingsStorage = new StorageSettings(this, {
         email: {
@@ -1357,7 +1358,31 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     // Shared by the boolean child switches, the night light dimmer, and the night vision switches -
     // all of these are just different views onto the same camera Settings message.
 
+    /**
+     * Shares an in-flight GET_SETTINGS across concurrent callers for the same camera, the same way
+     * ensureLocalStream()/startTwoWayAudio() do - without this, every child device's own refresh()
+     * put a separate request on the control channel. Because getDevice() constructs each child and
+     * fires refresh() without awaiting it, all of them land in the same tick on plugin load: seven
+     * child devices produced seven identical GET_SETTINGS requests (and seven ~457-byte responses)
+     * every time the plugin started.
+     *
+     * Deliberately in-flight sharing only, with no TTL cache behind it. PUT_SETTINGS doesn't
+     * reliably echo the new value back (see updateSettings()), so callers confirm a write by
+     * re-reading - and the night vision switches derive their state from a live read as well. A
+     * cache here would serve those confirmation reads a pre-write value.
+     */
     async fetchCameraSettings(cameraNativeId: string): Promise<DecodedSettings | undefined> {
+        const pending = this.pendingSettingsRequests.get(cameraNativeId);
+        if (pending)
+            return pending;
+        const promise = this.fetchCameraSettingsInternal(cameraNativeId).finally(() => {
+            this.pendingSettingsRequests.delete(cameraNativeId);
+        });
+        this.pendingSettingsRequests.set(cameraNativeId, promise);
+        return promise;
+    }
+
+    private async fetchCameraSettingsInternal(cameraNativeId: string): Promise<DecodedSettings | undefined> {
         const cameraUid = await this.getCameraUid(cameraNativeId);
         if (!cameraUid)
             throw new Error(`[${cameraNativeId}] settings: no camera_uid known for this device`);
