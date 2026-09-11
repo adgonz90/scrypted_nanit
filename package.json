@@ -30,17 +30,16 @@
       ]
    },
    "devDependencies": {
-      "@scrypted/sdk": "^0.2.87",
-      "@types/node": "^18.15.11",
+      "@scrypted/sdk": "file:../../scrypted/sdk",
+      "@types/node": "^26.1.1",
       "@types/ws": "^8.18.1",
-      "chalk": "^4.1.2",
-      "terser-webpack-plugin": "^5.6.1"
+      "typescript": "^5.9.3"
    },
    "version": "0.1.0",
    "dependencies": {
-      "axios": "^1.4.0",
+      "axios": "^1.18.1",
       "node-media-server": "^4.2.8",
-      "protobufjs": "^8.7.0",
-      "ws": "^8.21.0"
+      "protobufjs": "^8.7.1",
+      "ws": "^8.21.1"
    }
 }
