@@ -1,4 +1,4 @@
-import { AudioSensor, Battery, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, HumiditySensor, Intercom, MediaObject, MediaStreamOptions, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, TemperatureUnit, Thermometer, VideoCamera } from '@scrypted/sdk';
+import { AudioSensor, AudioVolumeControl, AudioVolumes, Battery, Brightness, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, HumiditySensor, Intercom, MediaObject, MediaStreamOptions, MotionSensor, OnOff, PictureOptions, Reboot, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, TemperatureUnit, Thermometer, VideoCamera } from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
 import { StorageSettings } from "@scrypted/sdk/storage-settings"
 import axios, { AxiosRequestConfig } from 'axios'
@@ -6,7 +6,7 @@ import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { NanitControlConnection } from './nanit/control-connection';
 import { LocalRtmpServer } from './nanit/local-rtmp-server';
-import { DecodedSensorData } from './nanit/proto';
+import { DecodedSensorData, DecodedSettings } from './nanit/proto';
 import { withTimestamps } from './nanit/timestamped-console';
 
 const { deviceManager, mediaManager } = sdk;
@@ -23,7 +23,7 @@ interface NanitBaby {
     camera_uid: string;
 }
 
-class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, AudioSensor, Battery, Thermometer, HumiditySensor, Settings {
+class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, AudioSensor, Battery, Thermometer, HumiditySensor, Settings, Reboot, DeviceProvider {
     settingsStorage = new StorageSettings(this, {
         persistentLocalStream: {
             title: 'Keep Local Stream Connected',
@@ -77,7 +77,6 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
     async takePicture(options?: PictureOptions): Promise<MediaObject> {
         this.console.log("trying to take a photo")
         const ffmpegInputVal = await this.buildFfmpegInput(options, true);
-        ffmpegInputVal.videoDecoderArguments = ['-vframes', '1', '-q:v', '2']
         return mediaManager.createMediaObject(Buffer.from(JSON.stringify(ffmpegInputVal)), ScryptedMimeTypes.FFmpegInput);
     }
 
@@ -159,6 +158,24 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
         await this.plugin.stopTwoWayAudio(this.nativeId);
     }
 
+    async reboot(): Promise<void> {
+        if (!this.nativeId)
+            throw new Error('missing nativeId');
+        await this.plugin.requestCameraReboot(this.nativeId);
+    }
+
+    // Declaring DeviceProvider (and delegating straight through to the plugin, which already
+    // handles every nativeId including this camera's own) lets HomeKit's generic camera accessory
+    // builder treat this device as a DeviceProvider and merge its child devices (Sleep, Night
+    // Light, etc.) onto the camera's own HomeKit accessory instead of a separate bridge accessory.
+    async getDevice(nativeId: string) {
+        return this.plugin.getDevice(nativeId);
+    }
+
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
+        return this.plugin.releaseDevice(id, nativeId);
+    }
+
     // most cameras have have motion and doorbell press events, but dont notify when the event ends.
     // so set a timeout ourselves to reset the state.
     triggerAudioDetected() {
@@ -191,6 +208,12 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
             this.console.log(`[${this.nativeId}] sensor data: ${JSON.stringify(sensor)}`);
         if (sensor.sensorType === 'NIGHT') {
             this.lastNightEventTimestamp = sensor.timestamp;
+            // Confirmed against the decompiled app (ControlSocketMessageHandler.analyzeSensorData():
+            // NIGHT's value field is a plain boolean signal, not a magnitude - value === 1 means IR
+            // is currently engaged, dispatched there to the app's own "IR" event. Used to keep the
+            // Night Vision "On" child switch's displayed state live while Automatic mode is engaged.
+            if (this.nativeId)
+                this.plugin.updateNightVisionLiveState(this.nativeId, sensor.value === 1);
         }
         // isAlert isn't a reliable gate for MOTION - instead this requires value === 2 (a discrete
         // detection-level code, not a magnitude) and valueMilli < 350000 (likely a duration/score
@@ -230,8 +253,240 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
     }
 }
 
+// Boolean camera Settings fields exposed as simple child OnOff switches, one Scrypted device per
+// field. Child devices (nativeId `${babyUid}:${slug}`, providerNativeId pointing at the camera)
+// rather than extra interfaces on the camera device itself, since a single device can only
+// implement OnOff once - three independent booleans need three separate devices to each get their
+// own HomeKit accessory / Home Assistant switch entity.
+const BOOLEAN_SETTING_CHILD_DEVICES: { slug: string; name: string; settingsField: 'sleepMode' | 'statusLightOn' | 'micMuteOn'; invert?: boolean }[] = [
+    // Display name is "Camera Active" and the polarity is inverted from the raw wire field - this
+    // is Nanit's own camera standby toggle, confirmed against the decompiled app
+    // (ControlSocketMessageHandler.setStandbyMode, strings.xml camera_standby_is_off_description):
+    // "All video and sound capturing, Insights collection and notifications are suspended." Not a
+    // mild pause - it's a full off switch. The wire field (sleepMode=true means "camera off") reads
+    // backwards as a HomeKit/HA switch ("turn the switch on to turn the camera off"), so this
+    // device inverts it: on=true means the camera is actively monitoring, on=false means standby -
+    // matches how every other power switch behaves. slug/settingsField stay as-is (internal
+    // identifiers, changing the slug would trigger a device recreate - see the syncDevices() note
+    // on scoped onDevicesChanged calls).
+    { slug: 'sleep', name: 'Camera Active', settingsField: 'sleepMode', invert: true },
+    { slug: 'statuslight', name: 'Status Light', settingsField: 'statusLightOn' },
+    // Confirmed via decompiled app (AudioSettings.java -> strings.xml settings_description_sound):
+    // muting this also stops sound notifications (cry/sound alerts), not just the two-way-talk mic.
+    { slug: 'micmute', name: 'Mic Mute', settingsField: 'micMuteOn' },
+];
+
+/** A single boolean camera Settings field (sleepMode/statusLightOn/micMuteOn), exposed as an OnOff switch. */
+class NanitSettingSwitch extends ScryptedDeviceBase implements OnOff {
+    on?: boolean;
+
+    constructor(
+        public plugin: NanitCameraPlugin,
+        nativeId: string,
+        public readonly cameraNativeId: string,
+        public readonly settingsField: 'sleepMode' | 'statusLightOn' | 'micMuteOn',
+        public readonly invert: boolean = false,
+    ) {
+        super(nativeId);
+    }
+
+    async turnOn(): Promise<void> {
+        await this.plugin.updateCameraBooleanSetting(this.cameraNativeId, this.settingsField, !this.invert);
+        this.on = true;
+    }
+
+    async turnOff(): Promise<void> {
+        await this.plugin.updateCameraBooleanSetting(this.cameraNativeId, this.settingsField, this.invert);
+        this.on = false;
+    }
+
+    /** Pulls the current value from the camera - called on first load so the switch doesn't start undefined. */
+    async refresh(): Promise<void> {
+        const settings = await this.plugin.fetchCameraSettings(this.cameraNativeId);
+        const value = settings?.[this.settingsField];
+        if (typeof value === 'boolean')
+            this.on = this.invert ? !value : value;
+    }
+}
+
+const NIGHT_LIGHT_SLUG = 'nightlight';
+
+/**
+ * The physical night light (Settings.nightLightBr), exposed as a dimmable Light - OnOff at
+ * brightness 0, Brightness for the level. The camera has no separate on/off bit for this, just a
+ * brightness value where 0 means off.
+ *
+ * nightLightBr's real-world scale isn't confirmed against a live camera (the decompiled app's own
+ * UI code is obfuscated, same limitation as PUT_REBOOT's `force` field) - this assumes it's already
+ * 0-100, matching Scrypted's own Brightness range, and passes the value straight through. Worth
+ * verifying once deployed (requestSettings() after setting a known value) and adjusting the mapping
+ * here if the camera actually expects a different scale.
+ */
+class NanitNightLightDevice extends ScryptedDeviceBase implements OnOff, Brightness {
+    on?: boolean;
+    brightness?: number;
+
+    constructor(public plugin: NanitCameraPlugin, nativeId: string, public readonly cameraNativeId: string) {
+        super(nativeId);
+    }
+
+    async turnOn(): Promise<void> {
+        await this.setBrightness(this.brightness && this.brightness > 0 ? this.brightness : 100);
+    }
+
+    async turnOff(): Promise<void> {
+        await this.setBrightness(0);
+    }
+
+    async setBrightness(brightness: number): Promise<void> {
+        await this.plugin.updateCameraSettings(this.cameraNativeId, { nightLightBr: brightness });
+        this.brightness = brightness;
+        this.on = brightness > 0;
+    }
+
+    /** Pulls the current value from the camera - called on first load so the light doesn't start undefined. */
+    async refresh(): Promise<void> {
+        const settings = await this.plugin.fetchCameraSettings(this.cameraNativeId);
+        if (typeof settings?.nightLightBr === 'number') {
+            this.brightness = settings.nightLightBr;
+            this.on = settings.nightLightBr > 0;
+        }
+    }
+}
+
+const NIGHT_VISION_AUTO_SLUG = 'nightvision-auto';
+const NIGHT_VISION_ON_SLUG = 'nightvision-on';
+
+/**
+ * Two switches reducing Settings.nightVision's 3-state enum (OFF/AUTOMATIC/ON) to independent
+ * booleans, coordinated through the plugin (see setNightVision()/updateNightVisionLiveState()):
+ * - Automatic: on = nightVision AUTOMATIC. Off = freezes whatever the On switch is currently
+ *   (live-)showing as an explicit ON/OFF value, so turning off Automatic doesn't silently change
+ *   the picture.
+ * - On (manual): always sets nightVision to ON/OFF explicitly and turns Automatic off - pressing
+ *   this is always an override. While Automatic is on, this switch's displayed state instead
+ *   live-reflects the camera's actual current IR-cut state, fed by NIGHT sensor pushes - see the
+ *   comment in handleSensorData() for how that's confirmed against the decompiled app.
+ */
+class NanitNightVisionSwitch extends ScryptedDeviceBase implements OnOff {
+    on?: boolean;
+
+    constructor(
+        public plugin: NanitCameraPlugin,
+        nativeId: string,
+        public readonly cameraNativeId: string,
+        public readonly kind: 'automatic' | 'on',
+    ) {
+        super(nativeId);
+    }
+
+    async turnOn(): Promise<void> {
+        await this.plugin.setNightVision(this.cameraNativeId, this.kind, true);
+    }
+
+    async turnOff(): Promise<void> {
+        await this.plugin.setNightVision(this.cameraNativeId, this.kind, false);
+    }
+
+    /** Pulls the current value from the camera - called on first load so the switch doesn't start undefined. */
+    async refresh(): Promise<void> {
+        const settings = await this.plugin.fetchCameraSettings(this.cameraNativeId);
+        if (!settings?.nightVision)
+            return;
+        if (this.kind === 'automatic')
+            this.on = settings.nightVision === 'AUTOMATIC';
+        else
+            this.on = settings.nightVision === 'ON';
+    }
+}
+
+const SPEAKER_VOLUME_SLUG = 'speakervolume';
+
+/**
+ * Speaker volume (Settings.volume), exposed via AudioVolumeControl - the proper interface for this,
+ * only available once the SDK dependency was upgraded (it doesn't exist in the SDK version this
+ * plugin was pinned to before that). Only the 'speaker' key is populated - this camera's protocol
+ * has no separate microphone/intercom volume *level*; mic mute is a boolean (micMuteOn), already
+ * its own child switch, not a level this interface would represent.
+ *
+ * volume's real-world scale isn't confirmed against a live camera - same caveat as nightLightBr's in
+ * NanitNightLightDevice - this assumes it's already 0-100 and passes the value straight through.
+ */
+class NanitSpeakerVolumeDevice extends ScryptedDeviceBase implements AudioVolumeControl {
+    audioVolumes?: AudioVolumes;
+
+    constructor(public plugin: NanitCameraPlugin, nativeId: string, public readonly cameraNativeId: string) {
+        super(nativeId);
+    }
+
+    async setAudioVolumes(audioVolumes: AudioVolumes): Promise<void> {
+        if (typeof audioVolumes.speaker !== 'number')
+            return;
+        await this.plugin.updateCameraSettings(this.cameraNativeId, { volume: audioVolumes.speaker });
+        this.audioVolumes = { speaker: audioVolumes.speaker };
+    }
+
+    /** Pulls the current value from the camera - called on first load so it doesn't start undefined. */
+    async refresh(): Promise<void> {
+        const settings = await this.plugin.fetchCameraSettings(this.cameraNativeId);
+        if (typeof settings?.volume === 'number')
+            this.audioVolumes = { speaker: settings.volume };
+    }
+}
+
+const SPEAKER_VOLUME_LIGHT_SLUG = 'speakervolume-light';
+
+/**
+ * Same underlying Settings.volume field as NanitSpeakerVolumeDevice above, but exposed as a
+ * dimmable Light (OnOff + Brightness) instead of AudioVolumeControl - purely a HomeKit workaround.
+ * Apple's Home app doesn't render a standalone Service.Speaker outside TV/AirPlay contexts (the
+ * "correct" AudioVolumeControl interface is confirmed invisible there), but Lightbulb+Brightness
+ * is proven working (same trick NanitNightLightDevice already uses). Deliberately a separate
+ * device from NanitSpeakerVolumeDevice, not dual interfaces on one device, so this stays
+ * MQTT/HA-invisible by default (no extension enabled on it) without touching the already-working
+ * AudioVolumeControl -> number entity in the mqtt fork.
+ */
+class NanitSpeakerVolumeLightDevice extends ScryptedDeviceBase implements OnOff, Brightness {
+    on?: boolean;
+    brightness?: number;
+
+    constructor(public plugin: NanitCameraPlugin, nativeId: string, public readonly cameraNativeId: string) {
+        super(nativeId);
+    }
+
+    async turnOn(): Promise<void> {
+        await this.setBrightness(this.brightness && this.brightness > 0 ? this.brightness : 100);
+    }
+
+    async turnOff(): Promise<void> {
+        await this.setBrightness(0);
+    }
+
+    async setBrightness(brightness: number): Promise<void> {
+        await this.plugin.updateCameraSettings(this.cameraNativeId, { volume: brightness });
+        this.brightness = brightness;
+        this.on = brightness > 0;
+    }
+
+    /** Pulls the current value from the camera - called on first load so the light doesn't start undefined. */
+    async refresh(): Promise<void> {
+        const settings = await this.plugin.fetchCameraSettings(this.cameraNativeId);
+        if (typeof settings?.volume === 'number') {
+            this.brightness = settings.volume;
+            this.on = settings.volume > 0;
+        }
+    }
+}
+
 class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings, DeviceCreator {
     devices = new Map<string, NanitCameraDevice>();
+    settingSwitches = new Map<string, NanitSettingSwitch>();
+    nightLightDevices = new Map<string, NanitNightLightDevice>();
+    nightVisionSwitches = new Map<string, NanitNightVisionSwitch>();
+    /** Best-known "IR currently engaged" state per camera nativeId, fed by NIGHT sensor pushes. */
+    nightVisionLiveOn = new Map<string, boolean>();
+    speakerVolumeDevices = new Map<string, NanitSpeakerVolumeDevice>();
+    speakerVolumeLightDevices = new Map<string, NanitSpeakerVolumeLightDevice>();
     access_token = '';
     mfa_token = '';
     failedCount = 0;
@@ -358,6 +613,8 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 ScryptedInterface.Intercom,
                 ScryptedInterface.Settings,
                 ScryptedInterface.Battery,
+                ScryptedInterface.Reboot,
+                ScryptedInterface.DeviceProvider,
             ],
             name: settings.name?.toString(),
         });
@@ -533,6 +790,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     }
 
     private async fetchBabiesInternal(): Promise<NanitBaby[]> {
+        this.console.log("fetching /babies");
         await this.tryLogin();
         const config = {
             headers:{
@@ -551,7 +809,8 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
         if (this.verboseLogging)
             this.console.log("Sync Devices")
         const babies = await this.fetchBabies();
-        const devices: Device[] = [];
+        const cameraDevices: Device[] = [];
+        const childDevicesByCamera = new Map<string, Device[]>();
         for (const camera of babies) {
             const nativeId = camera.uid;
             const interfaces = [
@@ -560,6 +819,8 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 ScryptedInterface.Intercom,
                 ScryptedInterface.Settings,
                 ScryptedInterface.Battery,
+                ScryptedInterface.Reboot,
+                ScryptedInterface.DeviceProvider,
             ];
 
             const device: Device = {
@@ -573,12 +834,87 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 type: ScryptedDeviceType.Camera,
                 interfaces,
             };
-            devices.push(device);
+            cameraDevices.push(device);
+
+            const childDevices: Device[] = [];
+
+            // Unprefixed - these are child devices of the camera (Scrypted's own UI nests them
+            // under it, HomeKit merges them onto its accessory, and HA's MQTT discovery groups
+            // them under it via via_device), so repeating the camera's name would be redundant
+            // everywhere that matters. The one tradeoff: a second Nanit camera would produce
+            // identically-named children, disambiguated only by that HA/Scrypted/HomeKit nesting,
+            // not by the name itself.
+            for (const spec of BOOLEAN_SETTING_CHILD_DEVICES) {
+                childDevices.push({
+                    nativeId: `${nativeId}:${spec.slug}`,
+                    name: spec.name,
+                    type: ScryptedDeviceType.Switch,
+                    interfaces: [ScryptedInterface.OnOff],
+                });
+            }
+
+            childDevices.push({
+                nativeId: `${nativeId}:${NIGHT_LIGHT_SLUG}`,
+                name: 'Night Light',
+                type: ScryptedDeviceType.Light,
+                interfaces: [ScryptedInterface.OnOff, ScryptedInterface.Brightness],
+            });
+
+            childDevices.push({
+                nativeId: `${nativeId}:${NIGHT_VISION_AUTO_SLUG}`,
+                name: 'Night Vision Automatic',
+                type: ScryptedDeviceType.Switch,
+                interfaces: [ScryptedInterface.OnOff],
+            });
+            childDevices.push({
+                nativeId: `${nativeId}:${NIGHT_VISION_ON_SLUG}`,
+                name: 'Night Vision On',
+                type: ScryptedDeviceType.Switch,
+                interfaces: [ScryptedInterface.OnOff],
+            });
+
+            childDevices.push({
+                nativeId: `${nativeId}:${SPEAKER_VOLUME_SLUG}`,
+                name: 'Speaker Volume',
+                type: ScryptedDeviceType.Speaker,
+                interfaces: [ScryptedInterface.AudioVolumeControl],
+            });
+
+            // HomeKit-only workaround for the AudioVolumeControl device above not rendering in
+            // Home app - see NanitSpeakerVolumeLightDevice. Same display name is fine; it's a
+            // different device (different nativeId/type), distinguishable in Scrypted's own UI by
+            // icon/type, and MQTT-invisible unless its extension is separately enabled.
+            childDevices.push({
+                nativeId: `${nativeId}:${SPEAKER_VOLUME_LIGHT_SLUG}`,
+                name: 'Speaker Volume',
+                type: ScryptedDeviceType.Light,
+                interfaces: [ScryptedInterface.OnOff, ScryptedInterface.Brightness],
+            });
+
+            childDevicesByCamera.set(nativeId, childDevices);
         }
 
+        // Cameras are registered first, in their own manifest (implicitly provided by this
+        // plugin's own root device). Each camera's children are then pushed in a SEPARATE
+        // onDevicesChanged call scoped to that camera via the manifest-level providerNativeId -
+        // onDevicesChanged only respects providerNativeId at the manifest level, overwriting
+        // it on every individual device in the call (see @scrypted/server's
+        // PluginHostAPI.onDevicesChanged), so a per-device providerNativeId field is silently
+        // ignored when devices are batched into one shared call. Splitting into one call per
+        // camera is what actually establishes each child's providerId as the camera's device
+        // id (rather than this plugin's own root device id), which HomeKit's DeviceProvider
+        // child-merging (getChildDevices) depends on to find them.
         await deviceManager.onDevicesChanged({
-            devices,
+            devices: cameraDevices,
         });
+
+        for (const [nativeId, childDevices] of childDevicesByCamera) {
+            await deviceManager.onDevicesChanged({
+                providerNativeId: nativeId,
+                devices: childDevices,
+            });
+        }
+
         if (this.verboseLogging)
             this.console.log('discovered devices');
     }
@@ -620,6 +956,8 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             ScryptedInterface.VideoCamera,
             ScryptedInterface.Intercom,
             ScryptedInterface.Settings,
+            ScryptedInterface.Reboot,
+            ScryptedInterface.DeviceProvider,
         ];
         if (device.persistentLocalStream)
             // MotionSensor/AudioSensor are only ever fed by the control channel's sensor-data
@@ -669,6 +1007,66 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     async getDevice(nativeId: string) {
         if (this.verboseLogging)
             this.console.log("get device with id " + nativeId)
+
+        const booleanSpec = BOOLEAN_SETTING_CHILD_DEVICES.find(spec => nativeId.endsWith(`:${spec.slug}`));
+        if (booleanSpec) {
+            if (!this.settingSwitches.has(nativeId)) {
+                const cameraNativeId = nativeId.slice(0, -(booleanSpec.slug.length + 1));
+                const child = new NanitSettingSwitch(this, nativeId, cameraNativeId, booleanSpec.settingsField, booleanSpec.invert);
+                this.settingSwitches.set(nativeId, child);
+                child.refresh().catch(err =>
+                    this.console.warn(`[${nativeId}] failed to refresh initial state: ${err.message}`));
+            }
+            return this.settingSwitches.get(nativeId);
+        }
+
+        if (nativeId.endsWith(`:${NIGHT_LIGHT_SLUG}`)) {
+            if (!this.nightLightDevices.has(nativeId)) {
+                const cameraNativeId = nativeId.slice(0, -(NIGHT_LIGHT_SLUG.length + 1));
+                const child = new NanitNightLightDevice(this, nativeId, cameraNativeId);
+                this.nightLightDevices.set(nativeId, child);
+                child.refresh().catch(err =>
+                    this.console.warn(`[${nativeId}] failed to refresh initial state: ${err.message}`));
+            }
+            return this.nightLightDevices.get(nativeId);
+        }
+
+        const nightVisionKind = nativeId.endsWith(`:${NIGHT_VISION_AUTO_SLUG}`) ? 'automatic'
+            : nativeId.endsWith(`:${NIGHT_VISION_ON_SLUG}`) ? 'on' : undefined;
+        if (nightVisionKind) {
+            if (!this.nightVisionSwitches.has(nativeId)) {
+                const slug = nightVisionKind === 'automatic' ? NIGHT_VISION_AUTO_SLUG : NIGHT_VISION_ON_SLUG;
+                const cameraNativeId = nativeId.slice(0, -(slug.length + 1));
+                const child = new NanitNightVisionSwitch(this, nativeId, cameraNativeId, nightVisionKind);
+                this.nightVisionSwitches.set(nativeId, child);
+                child.refresh().catch(err =>
+                    this.console.warn(`[${nativeId}] failed to refresh initial state: ${err.message}`));
+            }
+            return this.nightVisionSwitches.get(nativeId);
+        }
+
+        if (nativeId.endsWith(`:${SPEAKER_VOLUME_LIGHT_SLUG}`)) {
+            if (!this.speakerVolumeLightDevices.has(nativeId)) {
+                const cameraNativeId = nativeId.slice(0, -(SPEAKER_VOLUME_LIGHT_SLUG.length + 1));
+                const child = new NanitSpeakerVolumeLightDevice(this, nativeId, cameraNativeId);
+                this.speakerVolumeLightDevices.set(nativeId, child);
+                child.refresh().catch(err =>
+                    this.console.warn(`[${nativeId}] failed to refresh initial state: ${err.message}`));
+            }
+            return this.speakerVolumeLightDevices.get(nativeId);
+        }
+
+        if (nativeId.endsWith(`:${SPEAKER_VOLUME_SLUG}`)) {
+            if (!this.speakerVolumeDevices.has(nativeId)) {
+                const cameraNativeId = nativeId.slice(0, -(SPEAKER_VOLUME_SLUG.length + 1));
+                const child = new NanitSpeakerVolumeDevice(this, nativeId, cameraNativeId);
+                this.speakerVolumeDevices.set(nativeId, child);
+                child.refresh().catch(err =>
+                    this.console.warn(`[${nativeId}] failed to refresh initial state: ${err.message}`));
+            }
+            return this.speakerVolumeDevices.get(nativeId);
+        }
+
         if (!this.devices.has(nativeId)) {
             const camera = new NanitCameraDevice(this, nativeId);
 
@@ -689,6 +1087,26 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     }
 
     async releaseDevice(id: string, nativeId: string): Promise<void> {
+        if (this.settingSwitches.has(nativeId)) {
+            this.settingSwitches.delete(nativeId);
+            return;
+        }
+        if (this.nightLightDevices.has(nativeId)) {
+            this.nightLightDevices.delete(nativeId);
+            return;
+        }
+        if (this.nightVisionSwitches.has(nativeId)) {
+            this.nightVisionSwitches.delete(nativeId);
+            return;
+        }
+        if (this.speakerVolumeDevices.has(nativeId)) {
+            this.speakerVolumeDevices.delete(nativeId);
+            return;
+        }
+        if (this.speakerVolumeLightDevices.has(nativeId)) {
+            this.speakerVolumeLightDevices.delete(nativeId);
+            return;
+        }
         this.cancelScheduledTeardown(nativeId);
         this.controlConnections.get(nativeId)?.dispose();
         this.controlConnections.delete(nativeId);
@@ -825,7 +1243,6 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
     private async getCameraUid(nativeId: string): Promise<string | undefined> {
         let cameraUid = this.cameraUidByNativeId.get(nativeId);
         if (!cameraUid) {
-            this.console.log(`[${nativeId}] camera_uid not cached yet, fetching /babies`);
             await this.fetchBabies();
             cameraUid = this.cameraUidByNativeId.get(nativeId);
         }
@@ -924,6 +1341,85 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
 
         this.console.warn(`${prefix} camera did not start publishing within ${timeoutMs}ms - falling back to cloud`);
         return undefined;
+    }
+
+    // ---- Reboot ----
+
+    async requestCameraReboot(nativeId: string): Promise<void> {
+        const cameraUid = await this.getCameraUid(nativeId);
+        if (!cameraUid)
+            throw new Error(`[${nativeId}] reboot: no camera_uid known for this device`);
+        const connection = this.getControlConnection(nativeId, cameraUid);
+        await connection.requestReboot();
+    }
+
+    // ---- Camera Settings (night vision, night light, sleep mode, status LED, mic mute, volume) ----
+    // Shared by the boolean child switches, the night light dimmer, and the night vision switches -
+    // all of these are just different views onto the same camera Settings message.
+
+    async fetchCameraSettings(cameraNativeId: string): Promise<DecodedSettings | undefined> {
+        const cameraUid = await this.getCameraUid(cameraNativeId);
+        if (!cameraUid)
+            throw new Error(`[${cameraNativeId}] settings: no camera_uid known for this device`);
+        const connection = this.getControlConnection(cameraNativeId, cameraUid);
+        return connection.requestSettings();
+    }
+
+    async updateCameraSettings(cameraNativeId: string, partial: DecodedSettings): Promise<void> {
+        const cameraUid = await this.getCameraUid(cameraNativeId);
+        if (!cameraUid)
+            throw new Error(`[${cameraNativeId}] settings: no camera_uid known for this device`);
+        const connection = this.getControlConnection(cameraNativeId, cameraUid);
+        await connection.updateSettings(partial);
+    }
+
+    async updateCameraBooleanSetting(cameraNativeId: string, field: 'sleepMode' | 'statusLightOn' | 'micMuteOn', value: boolean): Promise<void> {
+        await this.updateCameraSettings(cameraNativeId, { [field]: value });
+    }
+
+    /**
+     * Coordinates the Automatic/On night vision switch pair (see NanitNightVisionSwitch) - both
+     * ultimately just set Settings.nightVision, but which value depends on the other switch's
+     * current state, and both switches' displayed `on` need updating together since only one of
+     * them caused this call.
+     */
+    async setNightVision(cameraNativeId: string, kind: 'automatic' | 'on', value: boolean): Promise<void> {
+        const autoSwitch = this.nightVisionSwitches.get(`${cameraNativeId}:${NIGHT_VISION_AUTO_SLUG}`);
+        const onSwitch = this.nightVisionSwitches.get(`${cameraNativeId}:${NIGHT_VISION_ON_SLUG}`);
+
+        if (kind === 'automatic') {
+            if (value) {
+                await this.updateCameraSettings(cameraNativeId, { nightVision: 'AUTOMATIC' });
+            }
+            else {
+                // Freeze whatever the On switch is currently (live-)showing as an explicit value,
+                // rather than letting turning off Automatic silently change the picture.
+                const frozen = onSwitch?.on ?? this.nightVisionLiveOn.get(cameraNativeId) ?? false;
+                await this.updateCameraSettings(cameraNativeId, { nightVision: frozen ? 'ON' : 'OFF' });
+                if (onSwitch)
+                    onSwitch.on = frozen;
+            }
+            if (autoSwitch)
+                autoSwitch.on = value;
+        }
+        else {
+            // Manual override - always exits Automatic, matching how "manual" should behave.
+            await this.updateCameraSettings(cameraNativeId, { nightVision: value ? 'ON' : 'OFF' });
+            this.nightVisionLiveOn.set(cameraNativeId, value);
+            if (onSwitch)
+                onSwitch.on = value;
+            if (autoSwitch)
+                autoSwitch.on = false;
+        }
+    }
+
+    /** Fed by NIGHT sensor pushes (handleSensorData()) - keeps the On switch's displayed state live while Automatic is engaged. */
+    updateNightVisionLiveState(cameraNativeId: string, irEngaged: boolean) {
+        this.nightVisionLiveOn.set(cameraNativeId, irEngaged);
+        const autoSwitch = this.nightVisionSwitches.get(`${cameraNativeId}:${NIGHT_VISION_AUTO_SLUG}`);
+        const onSwitch = this.nightVisionSwitches.get(`${cameraNativeId}:${NIGHT_VISION_ON_SLUG}`);
+        if (autoSwitch?.on && onSwitch)
+            onSwitch.on = irEngaged;
     }
 
     // ---- Two-way audio ----

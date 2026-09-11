@@ -1,5 +1,5 @@
 import WebSocket from 'ws';
-import { encodeControlMessage, decodeControlMessage, DecodedSensorData } from './proto';
+import { encodeControlMessage, decodeControlMessage, DecodedSensorData, DecodedSettings } from './proto';
 
 export interface ConnectionLogger {
     log(message: string): void;
@@ -9,9 +9,14 @@ export interface ConnectionLogger {
     verbose(message: string): void;
 }
 
+type ResolvedResponse = {
+    statusMessage?: string;
+    settings?: DecodedSettings;
+};
+
 type PendingRequest = {
     requestType: string;
-    resolve: (statusMessage: string | undefined) => void;
+    resolve: (response: ResolvedResponse) => void;
     reject: (err: Error) => void;
     timer: ReturnType<typeof setTimeout>;
 };
@@ -183,13 +188,13 @@ export class NanitControlConnection {
         this.logger.verbose(`${this.logPrefix} received control message (${data.length} bytes, hex: ${data.toString('hex')}): ${JSON.stringify(message)}`);
 
         if (message.type === 'RESPONSE' && message.response) {
-            const { requestId, requestType, statusCode, statusMessage } = message.response;
+            const { requestId, requestType, statusCode, statusMessage, settings } = message.response;
             const pending = this.pending.get(requestId);
             if (pending && pending.requestType === requestType) {
                 clearTimeout(pending.timer);
                 this.pending.delete(requestId);
                 if (statusCode === 200)
-                    pending.resolve(statusMessage);
+                    pending.resolve({ statusMessage, settings });
                 else
                     pending.reject(new Error(statusMessage || `unexpected status code ${statusCode}`));
             }
@@ -273,6 +278,37 @@ export class NanitControlConnection {
         }
     }
 
+    /** Fetches the camera's current Settings snapshot (night vision, night light, sleep mode, etc). */
+    async requestSettings(): Promise<DecodedSettings | undefined> {
+        await this.ensureConnected();
+        const { settings } = await this.sendRequest('GET_SETTINGS', { getSettings: { all: true } }, 10_000);
+        return settings;
+    }
+
+    /**
+     * Pushes a partial Settings update - only the fields present in `partial` are sent, matching
+     * proto2 optional-field semantics (an omitted field means "leave as-is", not "clear it"). The
+     * camera doesn't reliably echo back the new value in the PUT_SETTINGS response, so callers that
+     * need to confirm the change actually applied should follow up with requestSettings().
+     */
+    async updateSettings(partial: DecodedSettings): Promise<void> {
+        this.logger.log(`${this.logPrefix} requesting PUT_SETTINGS ${JSON.stringify(partial)}`);
+        await this.ensureConnected();
+        await this.sendRequest('PUT_SETTINGS', { settings: partial }, 10_000);
+        this.logger.log(`${this.logPrefix} camera acknowledged PUT_SETTINGS`);
+    }
+
+    /**
+     * Asks the camera to reboot. `force`'s real-world semantics aren't confirmed against the
+     * decompiled app (its call site is obfuscated) - omit it for a plain reboot request.
+     */
+    async requestReboot(force?: boolean): Promise<void> {
+        this.logger.log(`${this.logPrefix} requesting PUT_REBOOT${force !== undefined ? ` (force=${force})` : ''}`);
+        await this.ensureConnected();
+        await this.sendRequest('PUT_REBOOT', { reboot: force !== undefined ? { force } : {} }, 10_000);
+        this.logger.log(`${this.logPrefix} camera acknowledged PUT_REBOOT`);
+    }
+
     /**
      * Requests that the camera start/stop pulling two-way audio from rtmpUrl, correlated by
      * sessionId. Mirrors requestLocalStreaming(), but for the reversed direction: there we tell
@@ -308,7 +344,7 @@ export class NanitControlConnection {
         this.logger.log(`${this.logPrefix} camera confirmed two-way audio session ${sessionId} started`);
     }
 
-    private sendRequest(requestType: string, body: Record<string, unknown>, timeoutMs: number): Promise<string | undefined> {
+    private sendRequest(requestType: string, body: Record<string, unknown>, timeoutMs: number): Promise<ResolvedResponse> {
         const id = ++this.lastRequestId;
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {

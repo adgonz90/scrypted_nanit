@@ -179,6 +179,35 @@ message WebRtc {
   optional WebRtcStreamStopped streamStopped = 5;
 }
 
+// Camera settings (night vision, night light, sleep/suspend, status LED, mic mute, speaker volume,
+// and plenty of others this plugin doesn't act on and so leaves undeclared). GET_SETTINGS{all: true}
+// returns the full Settings snapshot in a RESPONSE; PUT_SETTINGS sends only the fields being changed
+// (proto2 optional semantics - an omitted field means "leave as-is", not "clear it").
+message Settings {
+  enum NightVision {
+    OFF = 0;
+    AUTOMATIC = 1;
+    ON = 2;
+  }
+
+  optional NightVision nightVision = 2;
+  optional int32 volume = 9;
+  optional bool sleepMode = 11;
+  optional bool statusLightOn = 12;
+  optional bool micMuteOn = 20;
+  optional int32 nightLightBr = 24;
+}
+
+message GetSettings {
+  optional bool all = 1;
+}
+
+// PUT_REBOOT's body. force is optional and its real-world semantics aren't confirmed (the
+// decompiled app's own call site is obfuscated) - omitted entirely for a plain reboot request.
+message Reboot {
+  optional bool force = 1;
+}
+
 message Request {
   required int32 id = 1;
   required RequestType type = 2;
@@ -190,6 +219,9 @@ message Request {
   optional Control control = 15;
   optional AudioStreaming audioStreaming = 20;
   optional WebRtc webrtc = 36;
+  optional Settings settings = 5;
+  optional GetSettings getSettings = 6;
+  optional Reboot reboot = 35;
 }
 
 message Response {
@@ -200,6 +232,7 @@ message Response {
 
   repeated SensorData sensorData = 9;
   optional AudioStreaming audioStreaming = 20;
+  optional Settings settings = 6;
 }
 
 message Message {
@@ -239,6 +272,15 @@ export interface DecodedAudioStreaming {
     sessionId?: string;
 }
 
+export interface DecodedSettings {
+    nightVision?: 'OFF' | 'AUTOMATIC' | 'ON';
+    volume?: number;
+    sleepMode?: boolean;
+    statusLightOn?: boolean;
+    micMuteOn?: boolean;
+    nightLightBr?: number;
+}
+
 export interface DecodedMessage {
     type: 'KEEPALIVE' | 'REQUEST' | 'RESPONSE';
     request?: {
@@ -246,6 +288,7 @@ export interface DecodedMessage {
         type: string;
         sensorData?: DecodedSensorData[];
         audioStreaming?: DecodedAudioStreaming;
+        settings?: DecodedSettings;
         webrtc?: {
             streamStopped?: DecodedWebRtcStreamStopped;
         };
@@ -255,6 +298,7 @@ export interface DecodedMessage {
         requestType: string;
         statusCode: number;
         statusMessage?: string;
+        settings?: DecodedSettings;
     };
 }
 
