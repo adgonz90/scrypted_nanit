@@ -125,30 +125,6 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
             ? ['-analyzeduration', '1000000', '-probesize', '1000000', '-i', url]
             : ['-i', url];
 
-        // Rebroadcast picks how to ingest this stream in prebuffer-mixin's getParser(): if neither
-        // canUseRtspParser() nor canUseRtmpParser() matches the declared container, it falls back
-        // to STRING_DEFAULT, which is the ffmpeg path - an `ffmpeg -fflags +genpts -i rtmp://...
-        // -vcodec copy -acodec copy -f rtsp` process that repackages our RTMP into a local RTSP
-        // server that every consumer then reads from.
-        //
-        // Declaring container 'rtmp' (and supplying url, which the parser is given directly rather
-        // than as ffmpeg arguments) instead selects startRtmpSession() - Scrypted's own RTMP
-        // depacketizer, which repackages to RTSP in-process with no ffmpeg, no genpts, and no
-        // intermediate remux.
-        //
-        // Only for the local stream, and only when this isn't a snapshot grab:
-        // - The cloud fallback is rtmps://, which would also match startsWith('rtmp') but is
-        //   TLS-wrapped and is not something the RTMP parser can open. It must keep using ffmpeg.
-        // - Snapshots don't go through rebroadcast at all; they consume inputArguments directly,
-        //   so there's nothing to gain and the bounded probe args above still apply.
-        if (localUrl && !forSnapshot) {
-            return {
-                url: localUrl,
-                inputArguments,
-                mediaStreamOptions: this.buildStreamOptions('rtmp'),
-            };
-        }
-
         return {
             url: undefined,
             inputArguments,
@@ -175,16 +151,10 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
     //
     // keyframeInterval is omitted for the same reason - it hasn't been measured, and a wrong
     // value is worse than an absent one for consumers that use it to size prebuffers.
-    /**
-     * container is set only when the caller knows the stream really is plain RTMP - see
-     * buildFfmpegInput(). Left undefined here because getVideoStreamOptions() is answered before
-     * anything knows whether this particular stream will end up local (rtmp) or cloud (rtmps).
-     */
-    private buildStreamOptions(container?: string): ResponseMediaStreamOptions {
-        return {
+    async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
+        return [{
             id: this.nativeId + "-stream",
             allowBatteryPrebuffer: false,
-            container,
             video: {
                 codec: 'h264',
                 profile: 'main',
@@ -197,11 +167,7 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
                 sampleRate: 44100,
                 bitrate: 24576,
             },
-        };
-    }
-
-    async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
-        return [this.buildStreamOptions()];
+        }];
     }
 
 
