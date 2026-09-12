@@ -87,14 +87,23 @@ port 1935. This brings the same capability into Scrypted.
 path use the baby `uid` (also this plugin's `nativeId`). The control WebSocket uses `camera_uid`,
 a separate field in the same response. Mixing them up connects to a nonexistent URL.
 
-**`proto.ts` is verified against Nanit's real Android app, not guessed from captures.** The APK
-was decompiled with jadx (portable JRE + jadx-gui, no system Java needed) and the compiled
-protobuf class's `_FIELD_NUMBER` constants read directly. That corrected several things:
+**`proto.ts` is verified against Nanit's real Android app, not guessed from captures.** The
+decompiled app lives in the parent workspace at `../apk/` (jadx and its output are checked in
+there; see `../AGENT_CONTEXT.md` §8). The schema comes from:
+
+```
+../apk/export/sources/com/nanit/baby/Nanit.java          <- protobuf, *_FIELD_NUMBER / *_VALUE
+../apk/export/sources/com/nanit/baby/websocket/ControlSocketMessageHandler.java
+../apk/export/sources/com/nanit/baby/new_settings/sound/widgets/AudioSettings.java
+../apk/export/resources/res/values/strings.xml           <- what a setting actually does
+```
+
+Reading the compiled protobuf class's constants directly corrected several things:
 `SensorType` gained `SAFETY(6)`/`CRY(7)`/`UNKNOWN_8(8)`; what we had called
 `STREAM_STATUS_NOTICE` is really `PUT_WEBRTC_SERVICE_MESSAGE` (a WebRTC signaling channel this
 plugin doesn't otherwise use — only its `streamStopped` case is decoded); and several
 `RequestType` values were added. **If a "malformed control message" warning ever appears,
-decompiling the current app again is faster and far more reliable than guessing.**
+decompiling the current app again is faster and far more reliable than guessing (the APK in `../apk/` is from 2026-07-14 - re-pull if the protocol appears to have moved).**
 
 **The `RequestType` and `SensorType` enums must stay complete even though few values are acted
 on.** protobufjs fails to decode an entire message when a required enum field's wire value
