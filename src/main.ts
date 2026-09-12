@@ -1,4 +1,4 @@
-import { AudioSensor, AudioVolumeControl, AudioVolumes, Battery, Brightness, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, HumiditySensor, Intercom, MediaObject, MediaStreamOptions, MotionSensor, OnOff, PictureOptions, Reboot, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, TemperatureUnit, Thermometer, VideoCamera } from '@scrypted/sdk';
+import { AudioSensor, AudioVolumeControl, AudioVolumes, Battery, Brightness, Camera, Device, DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, HumiditySensor, Intercom, MediaObject, MediaStreamOptions, MotionSensor, OnOff, PictureOptions, Reboot, Refresh, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, TemperatureUnit, Thermometer, VideoCamera } from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
 import { StorageSettings } from "@scrypted/sdk/storage-settings"
 import axios, { AxiosRequestConfig } from 'axios'
@@ -275,6 +275,31 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
     }
 }
 
+// How often Scrypted should poll a settings child device for its current value. Deliberately
+// infrequent: this exists to notice changes made outside Scrypted (the Nanit app, or the camera
+// itself), not to drive the UI - writes from our own child devices already update their state
+// directly. Every child polling at this interval costs a single GET_SETTINGS between them, since
+// fetchCameraSettings() shares one in-flight request across all of them.
+const SETTINGS_REFRESH_FREQUENCY_SECONDS = 300;
+
+/**
+ * Whether a Scrypted-initiated refresh poll should be skipped because no control connection is
+ * currently open for this camera.
+ *
+ * applyDeviceMode() deliberately tears the control connection down when neither "Keep Local Stream
+ * Connected" nor climate sensors want it kept alive and nobody is watching. A poll must not quietly
+ * resurrect it - that would hold a WebSocket to Nanit open indefinitely and undo that teardown.
+ * When the connection is down the child simply keeps its last known value until something else
+ * brings the connection back up.
+ *
+ * Distinguished by the argument: Scrypted always passes refreshInterface when it drives a poll,
+ * while the construction-time call in getDevice() passes nothing - that one is still allowed to
+ * open a connection, exactly as it did before this guard existed.
+ */
+function skipPolledRefresh(plugin: NanitCameraPlugin, cameraNativeId: string, refreshInterface?: string): boolean {
+    return refreshInterface !== undefined && !plugin.hasControlConnection(cameraNativeId);
+}
+
 // Boolean camera Settings fields exposed as simple child OnOff switches, one Scrypted device per
 // field. Child devices (nativeId `${babyUid}:${slug}`, providerNativeId pointing at the camera)
 // rather than extra interfaces on the camera device itself, since a single device can only
@@ -299,7 +324,7 @@ const BOOLEAN_SETTING_CHILD_DEVICES: { slug: string; name: string; settingsField
 ];
 
 /** A single boolean camera Settings field (sleepMode/statusLightOn/micMuteOn), exposed as an OnOff switch. */
-class NanitSettingSwitch extends ScryptedDeviceBase implements OnOff {
+class NanitSettingSwitch extends ScryptedDeviceBase implements OnOff, Refresh {
     on?: boolean;
 
     constructor(
@@ -323,7 +348,13 @@ class NanitSettingSwitch extends ScryptedDeviceBase implements OnOff {
     }
 
     /** Pulls the current value from the camera - called on first load so the switch doesn't start undefined. */
-    async refresh(): Promise<void> {
+    async getRefreshFrequency(): Promise<number> {
+        return SETTINGS_REFRESH_FREQUENCY_SECONDS;
+    }
+
+    async refresh(refreshInterface?: string): Promise<void> {
+        if (skipPolledRefresh(this.plugin, this.cameraNativeId, refreshInterface))
+            return;
         const settings = await this.plugin.fetchCameraSettings(this.cameraNativeId);
         const value = settings?.[this.settingsField];
         if (typeof value === 'boolean')
@@ -344,7 +375,7 @@ const NIGHT_LIGHT_SLUG = 'nightlight';
  * verifying once deployed (requestSettings() after setting a known value) and adjusting the mapping
  * here if the camera actually expects a different scale.
  */
-class NanitNightLightDevice extends ScryptedDeviceBase implements OnOff, Brightness {
+class NanitNightLightDevice extends ScryptedDeviceBase implements OnOff, Brightness, Refresh {
     on?: boolean;
     brightness?: number;
 
@@ -367,7 +398,13 @@ class NanitNightLightDevice extends ScryptedDeviceBase implements OnOff, Brightn
     }
 
     /** Pulls the current value from the camera - called on first load so the light doesn't start undefined. */
-    async refresh(): Promise<void> {
+    async getRefreshFrequency(): Promise<number> {
+        return SETTINGS_REFRESH_FREQUENCY_SECONDS;
+    }
+
+    async refresh(refreshInterface?: string): Promise<void> {
+        if (skipPolledRefresh(this.plugin, this.cameraNativeId, refreshInterface))
+            return;
         const settings = await this.plugin.fetchCameraSettings(this.cameraNativeId);
         if (typeof settings?.nightLightBr === 'number') {
             this.brightness = settings.nightLightBr;
@@ -390,7 +427,7 @@ const NIGHT_VISION_ON_SLUG = 'nightvision-on';
  *   live-reflects the camera's actual current IR-cut state, fed by NIGHT sensor pushes - see the
  *   comment in handleSensorData() for how that's confirmed against the decompiled app.
  */
-class NanitNightVisionSwitch extends ScryptedDeviceBase implements OnOff {
+class NanitNightVisionSwitch extends ScryptedDeviceBase implements OnOff, Refresh {
     on?: boolean;
 
     constructor(
@@ -411,7 +448,13 @@ class NanitNightVisionSwitch extends ScryptedDeviceBase implements OnOff {
     }
 
     /** Pulls the current value from the camera - called on first load so the switch doesn't start undefined. */
-    async refresh(): Promise<void> {
+    async getRefreshFrequency(): Promise<number> {
+        return SETTINGS_REFRESH_FREQUENCY_SECONDS;
+    }
+
+    async refresh(refreshInterface?: string): Promise<void> {
+        if (skipPolledRefresh(this.plugin, this.cameraNativeId, refreshInterface))
+            return;
         const settings = await this.plugin.fetchCameraSettings(this.cameraNativeId);
         if (!settings?.nightVision)
             return;
@@ -434,7 +477,7 @@ const SPEAKER_VOLUME_SLUG = 'speakervolume';
  * volume's real-world scale isn't confirmed against a live camera - same caveat as nightLightBr's in
  * NanitNightLightDevice - this assumes it's already 0-100 and passes the value straight through.
  */
-class NanitSpeakerVolumeDevice extends ScryptedDeviceBase implements AudioVolumeControl {
+class NanitSpeakerVolumeDevice extends ScryptedDeviceBase implements AudioVolumeControl, Refresh {
     audioVolumes?: AudioVolumes;
 
     constructor(public plugin: NanitCameraPlugin, nativeId: string, public readonly cameraNativeId: string) {
@@ -449,7 +492,13 @@ class NanitSpeakerVolumeDevice extends ScryptedDeviceBase implements AudioVolume
     }
 
     /** Pulls the current value from the camera - called on first load so it doesn't start undefined. */
-    async refresh(): Promise<void> {
+    async getRefreshFrequency(): Promise<number> {
+        return SETTINGS_REFRESH_FREQUENCY_SECONDS;
+    }
+
+    async refresh(refreshInterface?: string): Promise<void> {
+        if (skipPolledRefresh(this.plugin, this.cameraNativeId, refreshInterface))
+            return;
         const settings = await this.plugin.fetchCameraSettings(this.cameraNativeId);
         if (typeof settings?.volume === 'number')
             this.audioVolumes = { speaker: settings.volume };
@@ -468,7 +517,7 @@ const SPEAKER_VOLUME_LIGHT_SLUG = 'speakervolume-light';
  * MQTT/HA-invisible by default (no extension enabled on it) without touching the already-working
  * AudioVolumeControl -> number entity in the mqtt fork.
  */
-class NanitSpeakerVolumeLightDevice extends ScryptedDeviceBase implements OnOff, Brightness {
+class NanitSpeakerVolumeLightDevice extends ScryptedDeviceBase implements OnOff, Brightness, Refresh {
     on?: boolean;
     brightness?: number;
 
@@ -491,7 +540,13 @@ class NanitSpeakerVolumeLightDevice extends ScryptedDeviceBase implements OnOff,
     }
 
     /** Pulls the current value from the camera - called on first load so the light doesn't start undefined. */
-    async refresh(): Promise<void> {
+    async getRefreshFrequency(): Promise<number> {
+        return SETTINGS_REFRESH_FREQUENCY_SECONDS;
+    }
+
+    async refresh(refreshInterface?: string): Promise<void> {
+        if (skipPolledRefresh(this.plugin, this.cameraNativeId, refreshInterface))
+            return;
         const settings = await this.plugin.fetchCameraSettings(this.cameraNativeId);
         if (typeof settings?.volume === 'number') {
             this.brightness = settings.volume;
@@ -872,7 +927,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                     nativeId: `${nativeId}:${spec.slug}`,
                     name: spec.name,
                     type: ScryptedDeviceType.Switch,
-                    interfaces: [ScryptedInterface.OnOff],
+                    interfaces: [ScryptedInterface.OnOff, ScryptedInterface.Refresh],
                 });
             }
 
@@ -880,27 +935,27 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 nativeId: `${nativeId}:${NIGHT_LIGHT_SLUG}`,
                 name: 'Night Light',
                 type: ScryptedDeviceType.Light,
-                interfaces: [ScryptedInterface.OnOff, ScryptedInterface.Brightness],
+                interfaces: [ScryptedInterface.OnOff, ScryptedInterface.Brightness, ScryptedInterface.Refresh],
             });
 
             childDevices.push({
                 nativeId: `${nativeId}:${NIGHT_VISION_AUTO_SLUG}`,
                 name: 'Night Vision Automatic',
                 type: ScryptedDeviceType.Switch,
-                interfaces: [ScryptedInterface.OnOff],
+                interfaces: [ScryptedInterface.OnOff, ScryptedInterface.Refresh],
             });
             childDevices.push({
                 nativeId: `${nativeId}:${NIGHT_VISION_ON_SLUG}`,
                 name: 'Night Vision On',
                 type: ScryptedDeviceType.Switch,
-                interfaces: [ScryptedInterface.OnOff],
+                interfaces: [ScryptedInterface.OnOff, ScryptedInterface.Refresh],
             });
 
             childDevices.push({
                 nativeId: `${nativeId}:${SPEAKER_VOLUME_SLUG}`,
                 name: 'Speaker Volume',
                 type: ScryptedDeviceType.Speaker,
-                interfaces: [ScryptedInterface.AudioVolumeControl],
+                interfaces: [ScryptedInterface.AudioVolumeControl, ScryptedInterface.Refresh],
             });
 
             // HomeKit-only workaround for the AudioVolumeControl device above not rendering in
@@ -911,7 +966,7 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
                 nativeId: `${nativeId}:${SPEAKER_VOLUME_LIGHT_SLUG}`,
                 name: 'Speaker Volume',
                 type: ScryptedDeviceType.Light,
-                interfaces: [ScryptedInterface.OnOff, ScryptedInterface.Brightness],
+                interfaces: [ScryptedInterface.OnOff, ScryptedInterface.Brightness, ScryptedInterface.Refresh],
             });
 
             childDevicesByCamera.set(nativeId, childDevices);
@@ -1191,6 +1246,11 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
             this.rtmpServer.stop();
             this.rtmpServer = undefined;
         }
+    }
+
+    /** Whether a control connection is currently open for this camera, without opening one. */
+    hasControlConnection(nativeId: string): boolean {
+        return this.controlConnections.has(nativeId);
     }
 
     private getControlConnection(nativeId: string, cameraUid: string): NanitControlConnection {
