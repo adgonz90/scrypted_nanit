@@ -374,8 +374,14 @@ export class NanitControlConnection {
     }
 
     /**
-     * Requests that the camera publish (or stop publishing) its RTMP stream to rtmpUrl, with a
-     * single non-fatal retry on the "too many mobile app connections" error.
+     * Requests that the camera publish (or stop publishing) its RTMP stream to rtmpUrl.
+     *
+     * The "too many mobile app connections" error is treated as non-fatal and retried
+     * indefinitely, every CONNECTION_LIMIT_BACKOFF_MS, rather than a set number of times: the
+     * condition is caused by something outside this plugin (Nanit's own app holding the camera's
+     * streaming slots) and clears on its own whenever that other client disconnects, so giving up
+     * after N attempts would just strand the camera on cloud until something else happened to
+     * trigger a fresh request. Callers are not expected to await this while it backs off.
      *
      * Concurrent callers requesting the same status share the one in-flight request instead of
      * each sending their own PUT_STREAMING - sending several redundant requests for the same
