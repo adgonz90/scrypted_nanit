@@ -1329,6 +1329,22 @@ class NanitCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Se
         const connection = this.getControlConnection(nativeId, cameraUid);
         const publishUrl = rtmp.getPublishUrl(host, nativeId);
 
+        // The camera has already declined to stream (its connection limit is full) and the
+        // in-flight request is sleeping until its next attempt, so no publisher can possibly
+        // arrive before then - waiting out timeoutMs here would just delay the cloud fallback by
+        // that much. Observed as every snapshot burning the full 8s while backed off.
+        //
+        // Deliberately doesn't send another PUT_STREAMING: requestLocalStreaming() already has
+        // one in flight that will retry on its own, and it self-heals - once the retry succeeds
+        // the camera publishes, isAlive() goes true above, and local resumes with no involvement
+        // from here.
+        const retryAfter = connection.getStreamingRetryAfter();
+        if (retryAfter !== undefined) {
+            const waitMs = retryAfter - Date.now();
+            this.console.warn(`${prefix} camera declined streaming (connection limit) and won't retry for ${waitMs}ms - falling back to cloud without waiting`);
+            return undefined;
+        }
+
         this.console.log(`${prefix} requesting camera to publish to ${publishUrl} (camera_uid ${cameraUid}, timeout ${timeoutMs}ms)`);
         const alivePromise = rtmp.waitForAlive(nativeId, timeoutMs);
         connection.requestLocalStreaming(publishUrl, 'STARTED').catch(err =>

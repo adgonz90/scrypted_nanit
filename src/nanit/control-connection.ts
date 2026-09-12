@@ -58,6 +58,7 @@ export class NanitControlConnection {
     private connectPromise?: Promise<void>;
     private disposed = false;
     private inFlightStreamingRequest?: { status: string, promise: Promise<void> };
+    private streamingRetryAfter?: number;
 
     onSensorData?: (sensor: DecodedSensorData) => void;
     onAliveChange?: (alive: boolean) => void;
@@ -381,7 +382,9 @@ export class NanitControlConnection {
      * condition is caused by something outside this plugin (Nanit's own app holding the camera's
      * streaming slots) and clears on its own whenever that other client disconnects, so giving up
      * after N attempts would just strand the camera on cloud until something else happened to
-     * trigger a fresh request. Callers are not expected to await this while it backs off.
+     * trigger a fresh request. Callers are not expected to await this while it backs off - see
+     * getStreamingRetryAfter(), which lets ensureLocalStream() fall straight through to cloud
+     * instead of waiting out its timeout on a publisher that cannot arrive yet.
      *
      * Concurrent callers requesting the same status share the one in-flight request instead of
      * each sending their own PUT_STREAMING - sending several redundant requests for the same
@@ -401,6 +404,22 @@ export class NanitControlConnection {
         return promise;
     }
 
+    /**
+     * When the camera is refusing to start streaming because its connection limit is full, the
+     * epoch-ms time the in-flight request will next retry; undefined when not backed off.
+     *
+     * Lets a caller distinguish "the camera hasn't published yet, keep waiting" from "the camera
+     * has actively declined and won't be asked again for minutes", which otherwise look identical
+     * from outside - the retry loop sleeps inside its own promise and nothing else can see it.
+     */
+    getStreamingRetryAfter(): number | undefined {
+        if (this.streamingRetryAfter === undefined)
+            return undefined;
+        if (this.streamingRetryAfter <= Date.now())
+            return undefined;
+        return this.streamingRetryAfter;
+    }
+
     private async requestLocalStreamingOnce(rtmpUrl: string, status: 'STARTED' | 'STOPPED' | 'PAUSED'): Promise<void> {
         this.logger.log(`${this.logPrefix} requesting PUT_STREAMING ${status} -> ${rtmpUrl}`);
         await this.ensureConnected();
@@ -416,7 +435,9 @@ export class NanitControlConnection {
             catch (err) {
                 if ((err as Error).message === CONNECTION_LIMIT_ERROR) {
                     this.logger.warn(`${this.logPrefix} too many Nanit app connections, retrying local streaming request in ${CONNECTION_LIMIT_BACKOFF_MS}ms`);
+                    this.streamingRetryAfter = Date.now() + CONNECTION_LIMIT_BACKOFF_MS;
                     await new Promise(r => setTimeout(r, CONNECTION_LIMIT_BACKOFF_MS));
+                    this.streamingRetryAfter = undefined;
                     continue;
                 }
                 this.logger.warn(`${this.logPrefix} PUT_STREAMING ${status} rejected: ${(err as Error).message}`);
