@@ -135,13 +135,35 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
         return "rtmps://media-secured.nanit.com/nanit/" + this.nativeId! + "." + this.plugin.access_token;
     }
 
+    // Declaring only `video.codec` left every consumer to discover the rest by probing, and the
+    // audio track undeclared entirely - visible in the HomeKit plugin's own logs as
+    // "a/v h264 opus found h264 undefined", i.e. it knew the video codec and nothing about audio.
+    //
+    // These are the camera's own encoder settings, measured with ffprobe against both the local
+    // RTMP stream and the cloud relay (identical, since it's the same encoder feeding both):
+    // h264 Main 1920x1080 @ 10fps ~3145kbps, and aac-LC 44100Hz mono ~24kbps. Advisory hints
+    // rather than a contract - they describe what this camera has been observed to send, and a
+    // different Nanit model could differ, so nothing here is enforced on the actual stream.
+    //
+    // keyframeInterval is deliberately omitted: it hasn't been measured, and a wrong value is
+    // worse than an absent one for consumers that use it to size prebuffers.
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
         return [{
             id: this.nativeId + "-stream",
             allowBatteryPrebuffer: false,
             video: {
                 codec: 'h264',
-            }
+                profile: 'main',
+                width: 1920,
+                height: 1080,
+                fps: 10,
+                bitrate: 3145728,
+            },
+            audio: {
+                codec: 'aac',
+                sampleRate: 44100,
+                bitrate: 24576,
+            },
         }];
     }
 
