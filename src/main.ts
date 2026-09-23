@@ -114,7 +114,7 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
         if (localUrl)
             this.console.log(`[${this.nativeId}] using LOCAL stream: ${localUrl}`);
         else
-            this.console.log(`[${this.nativeId}] using CLOUD stream (see preceding log line for why local wasn't used): ${this.cloudStreamUrl().replace(this.plugin.access_token, '<redacted>')}`);
+            this.console.log(`[${this.nativeId}] using CLOUD stream (why local wasn't used is logged by the Nanit plugin itself, not this camera): ${this.cloudStreamUrl().replace(this.plugin.access_token, '<redacted>')}`);
 
         // Snapshot grabs were consistently getting killed by Scrypted's own snapshot timeout
         // (~4-5s) before producing a frame. Our local RTMP source already sends header + cached
