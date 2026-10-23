@@ -255,6 +255,11 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
             this.console.log(`[${this.nativeId}] triggering audio detected from sensor data`);
             this.triggerAudioDetected();
         }
+        // Both rounded before they are published. The camera reports in thousandths, so nearly
+        // every reading is a new value - and each one is an event to HomeKit and Home Assistant and a
+        // line in the server log, since Scrypted only drops an assignment that does not change the
+        // value. Whole percent for humidity, as the Home app shows it and more precision than the
+        // sensor has; tenths for temperature, since a whole degree Celsius is too coarse for a nursery.
         else if (sensor.sensorType === 'TEMPERATURE' && sensor.valueMilli !== undefined) {
             // valueMilli is a milli-units reading (i.e. divide by 1000 for the actual value).
             // Confirmed against real hardware readings; the range check below just guards against
@@ -262,12 +267,12 @@ class NanitCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, 
             // show a nonsensical -1000C reading.
             const celsius = sensor.valueMilli / 1000;
             if (celsius > -50 && celsius < 80)
-                this.temperature = celsius;
+                this.temperature = Math.round(celsius * 10) / 10;
         }
         else if (sensor.sensorType === 'HUMIDITY' && sensor.valueMilli !== undefined) {
             const percent = sensor.valueMilli / 1000;
             if (percent >= 0 && percent <= 100)
-                this.humidity = percent;
+                this.humidity = Math.round(percent);
         }
     }
 
