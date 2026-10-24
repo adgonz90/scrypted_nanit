@@ -28,7 +28,7 @@ Motivation: Nanit's own app already does this local handoff — confirmed by wat
 NAT table while using it, where the camera connects straight to the viewing device's LAN IP on
 port 1935. This brings the same capability into Scrypted.
 
-## 2. Divergence from upstream — 19 commits
+## 2. Divergence from upstream — 24 commits
 
 ### Original feature work
 
@@ -62,6 +62,8 @@ port 1935. This brings the same capability into Scrypted.
 | `f6ad0ad` | **Poll child devices** (`Refresh`, 300s) so changes made in the Nanit app are noticed |
 | `2549b05` | Stop declaring a video bitrate — measured once, then observed to change |
 | `989b18f` → `279f961` | Declared `container: 'rtmp'` to bypass Rebroadcast's ffmpeg remux — **reverted**, see §4 |
+| `466fb8a` | Cloud-fallback message now points at the plugin's own log, where the reason is — it said "see preceding line" in the camera's log, where it never was |
+| `21a3561` | **Round temperature to the tenth and humidity to the whole percent** — the camera reports thousandths, so nearly every reading was a new event to HomeKit and Home Assistant and a server log line |
 
 ## 3. Where the code lives
 
